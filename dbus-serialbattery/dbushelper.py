@@ -1122,8 +1122,14 @@ class DbusHelper:
                 loop.quit()
 
         except Exception:
-            traceback.print_exc()
+            # Quit first: reporting the error can itself fail, e.g. when SIGTERM arrives while the traceback is
+            # being written and the signal handler logs to the same stderr ("reentrant call inside
+            # <_io.BufferedWriter name='<stderr>'>"). Without the quit the driver keeps running with frozen values.
             loop.quit()
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
 
     def publish_dbus(self) -> None:
         """
