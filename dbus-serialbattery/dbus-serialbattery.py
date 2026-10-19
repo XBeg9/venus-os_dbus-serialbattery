@@ -120,9 +120,33 @@ if CAPTURE_RAW_DATA:
 count_for_loops = 5
 delayed_loop_count = 0
 
+# The GLib main loop, set in main(). Module-level so that the signal handler can quit it.
+mainloop = None
+
+
+def quit_mainloop_then_log(loop, log, message: str) -> None:
+    """
+    Stop the main loop, then log the message, ignoring logging errors.
+
+    A signal handler can interrupt a write to stderr; logging from it then raises
+    "RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>". Quitting first means that error can no
+    longer keep the driver running with its poll source gone.
+
+    :param loop: The main loop, or None if it is not set up yet
+    :param log: The logging function, e.g. logger.info
+    :param message: The message to log
+    :return: None
+    """
+    if loop is not None:
+        loop.quit()
+    try:
+        log(message)
+    except Exception:
+        pass
+
 
 def main():
-    global expected_bms_types, supported_bms_types
+    global expected_bms_types, supported_bms_types, mainloop
 
     def exit_driver(sig, frame, code: int = 0) -> None:
         """
@@ -131,13 +155,10 @@ def main():
 
         :return: None
         """
-        logger.info("Exit signal received, exiting gracefully...")
+        # Stop the main loop (if set) before logging, see quit_mainloop_then_log()
+        quit_mainloop_then_log(globals().get("mainloop"), logger.info, "Exit signal received, exiting gracefully...")
 
         port = get_port()
-
-        # Stop the main loop, if set
-        if "mainloop" in globals() and mainloop is not None:
-            mainloop.quit()
 
         # For BLE and AIOBMSBLE connections, disconnect from the BLE device
         # Else it's very likely that the next connection attempt fails
@@ -156,7 +177,7 @@ def main():
             # Serial connection is automatically closed when driver exits
             pass
 
-        logger.info(f"Stopped dbus-serialbattery with exit code {code}")
+        quit_mainloop_then_log(None, logger.info, f"Stopped dbus-serialbattery with exit code {code}")
         sys.exit(code)
 
     # Register the signal handler
