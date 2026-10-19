@@ -120,8 +120,9 @@ if CAPTURE_RAW_DATA:
 count_for_loops = 5
 delayed_loop_count = 0
 
-# The GLib main loop, set in main(). Module-level so that the signal handler can quit it.
+# The GLib main loop and the CAN receiver thread, set in main(). Module-level so that the signal handler can stop them.
 mainloop = None
+can_thread = None
 
 
 def quit_mainloop_then_log(loop, log, message: str) -> None:
@@ -146,7 +147,7 @@ def quit_mainloop_then_log(loop, log, message: str) -> None:
 
 
 def main():
-    global expected_bms_types, supported_bms_types, mainloop
+    global expected_bms_types, supported_bms_types, mainloop, can_thread
 
     def exit_driver(sig, frame, code: int = 0) -> None:
         """
@@ -169,7 +170,7 @@ def main():
 
         # Stop the CanReceiverThread
         elif port.startswith(("can", "vecan", "vcan")):
-            if "can_thread" in globals() and can_thread is not None:
+            if can_thread is not None:
                 can_thread.stop()
 
         # Close the serial connection
