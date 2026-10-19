@@ -157,7 +157,7 @@ def main():
         :return: None
         """
         # Stop the main loop (if set) before logging, see quit_mainloop_then_log()
-        quit_mainloop_then_log(globals().get("mainloop"), logger.info, "Exit signal received, exiting gracefully...")
+        quit_mainloop_then_log(mainloop, logger.info, "Exit signal received, exiting gracefully...")
 
         port = get_port()
 
