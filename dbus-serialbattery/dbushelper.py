@@ -1033,11 +1033,13 @@ class DbusHelper:
                     time_since_first_error = self.error["timestamp_last"] - self.error["timestamp_first"]
 
                     # check if the cell voltages are good to go for some minutes
+                    # The bounds belong to the band: utils.py clamps BLOCK_ON_DISCONNECT_VOLTAGE_MAX to MAX_CELL_VOLTAGE,
+                    # so with '<' a top cell held at MAX_CELL_VOLTAGE (every top hold) could never count as safe
                     if self.cell_voltages_good is None:
                         self.cell_voltages_good = (
                             True
-                            if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
-                            and self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
+                            if self.battery.get_min_cell_voltage() >= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
+                            and self.battery.get_max_cell_voltage() <= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
                             else False
                         )
 
@@ -1068,15 +1070,15 @@ class DbusHelper:
                                 )
                                 logger.error(
                                     "    |- "
-                                    + f"Min cell voltage: {self.battery.get_min_cell_voltage():.3f} > "
+                                    + f"Min cell voltage: {self.battery.get_min_cell_voltage():.3f} >= "
                                     + f"Min Threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} --> "
-                                    + ("OK" if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
+                                    + ("OK" if self.battery.get_min_cell_voltage() >= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
                                 )
                                 logger.error(
                                     "    |- "
-                                    + f"Max cell voltage: {self.battery.get_max_cell_voltage():.3f} < "
+                                    + f"Max cell voltage: {self.battery.get_max_cell_voltage():.3f} <= "
                                     + f"Max threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} --> "
-                                    + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
+                                    + ("OK" if self.battery.get_max_cell_voltage() <= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
 
                             self.battery.init_values()
