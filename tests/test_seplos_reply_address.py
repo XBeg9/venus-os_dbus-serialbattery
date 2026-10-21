@@ -7,6 +7,7 @@ valid frame from the other pack, e.g. a late reply to an earlier request, was de
 under its service (cells, current, SoC, FET states).
 """
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,7 +42,12 @@ def reply_frame(address: int, info: bytes) -> bytes:
 
 
 class OneReplySerial:
-    """Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, read_until."""
+    """
+    Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, fileno.
+
+    The port is a pipe, and the whole reply is in it once the command is written. The write end stays open until the
+    port is closed, so a reply without CR waits out the read deadline like a quiet port instead of reading EOF.
+    """
 
     reply = b""
 
@@ -49,9 +55,12 @@ class OneReplySerial:
         pass
 
     def __enter__(self):
+        self.r, self.w = os.pipe()
         return self
 
     def __exit__(self, *exc):
+        os.close(self.r)
+        os.close(self.w)
         return False
 
     def flushOutput(self):
@@ -61,13 +70,11 @@ class OneReplySerial:
         pass
 
     def write(self, data):
+        os.write(self.w, type(self).reply)
         return len(data)
 
-    def read_until(self, expected=b"\n", size=None):
-        # the whole reply is already in the input buffer: pyserial returns it up to and including `expected`
-        reply = type(self).reply
-        end = reply.find(expected)
-        return reply if end < 0 else reply[: end + len(expected)]
+    def fileno(self):
+        return self.r
 
 
 @pytest.fixture
@@ -115,13 +122,11 @@ class Bus:
     One RS485 wire with both packs on it, seen through a USB adapter at 19200 baud.
 
     Replies are (arrival time, bytes); a frame lands whole at one instant. read_serial_data_seplos opens the port,
-    flushInput() (drops what already arrived), writes, then read_until(b"\\r") with timeout=1 s. pyserial 3.5's
-    read_until loops read(1): each read(1) returns as soon as a byte is in the input buffer or after the 1 s timeout,
-    and the loop stops at the expected bytes, at an empty read, or once the call's own 1 s has expired after a byte.
-    So the fake returns, at the arrival of the first frame that brings a CR within 1 s, everything up to and including
-    that CR (the rest stays in the input buffer until the next flushInput), and otherwise everything that arrived when
-    the 1 s is over. Not modelled: bytes trickling in until just before the deadline keep the real call open up to one
-    more second; every frame here arrives whole.
+    flushInput() (drops what already arrived), writes, then reads until the first CR or until 1 s after the write
+    (read_frame). So the read gets, at the arrival of the first frame that brings a CR within 1 s, everything up to and
+    including that CR (the rest stays in the input buffer until the next flushInput), and otherwise everything that
+    arrived when the 1 s is over. The bus clock is simulated: the read finds its bytes in the pipe at once, and a read
+    without CR waits out the real REPLY_TIMEOUT, which the test shortens.
     """
 
     def __init__(self, respond):
@@ -133,6 +138,8 @@ class Bus:
         bus = self
 
         class BusSerial(OneReplySerial):
+            read_started = False
+
             def flushInput(self):
                 bus.pending = [p for p in bus.pending if p[0] > bus.now]
 
@@ -144,14 +151,21 @@ class Bus:
                     bus.pending.append((bus.now + delay, frame))
                 return len(data)
 
-            def read_until(self, expected=b"\n", size=None):
+            def fileno(self):
+                # the read starts here: what it gets within its 1 s goes into the pipe, once
+                if not self.read_started:
+                    self.read_started = True
+                    os.write(self.w, self.window())
+                return self.r
+
+            def window(self):
                 end = bus.now + 1.0
                 got = b""
                 for arrival, chunk in sorted(p for p in bus.pending if p[0] <= end):
                     bus.pending.remove((arrival, chunk))
                     got += chunk
-                    if expected in got:
-                        cut = got.index(expected) + len(expected)
+                    if b"\r" in got:
+                        cut = got.index(b"\r") + 1
                         if cut < len(got):
                             bus.pending.append((arrival, got[cut:]))
                         bus.now = max(bus.now, arrival)
@@ -178,6 +192,7 @@ def test_a_late_reply_from_pack_0x00_is_not_published_as_pack_0x01(monkeypatch):
 
     bus = Bus(respond)
     monkeypatch.setattr(seplos_module.serial, "Serial", bus.serial())
+    monkeypatch.setattr(seplos_module, "REPLY_TIMEOUT", 0.05)  # the bus clock decides what arrives, not the wall clock
     p0, p1 = make_seplos(b"\x00"), make_seplos(b"\x01")
     for c, mv in zip(p1.cells, p1_cells):  # pack 0x01's last good values
         c.voltage = mv / 1000

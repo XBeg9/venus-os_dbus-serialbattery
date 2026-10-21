@@ -8,6 +8,7 @@ the driver exited and both pack services left D-Bus until serial-starter restart
 undecodable data as a failed read; now every read does, and publish_battery counts it like any other failed read.
 """
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,7 +40,12 @@ def reply_frame(address: int, info: bytes) -> bytes:
 
 
 class OneReplySerial:
-    """Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, read_until."""
+    """
+    Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, fileno.
+
+    The port is a pipe, and the whole reply is in it once the command is written. The write end stays open until the
+    port is closed, so a reply without CR waits out the read deadline like a quiet port instead of reading EOF.
+    """
 
     reply = b""
 
@@ -47,9 +53,12 @@ class OneReplySerial:
         pass
 
     def __enter__(self):
+        self.r, self.w = os.pipe()
         return self
 
     def __exit__(self, *exc):
+        os.close(self.r)
+        os.close(self.w)
         return False
 
     def flushOutput(self):
@@ -59,13 +68,11 @@ class OneReplySerial:
         pass
 
     def write(self, data):
+        os.write(self.w, type(self).reply)
         return len(data)
 
-    def read_until(self, expected=b"\n", size=None):
-        # the whole reply is already in the input buffer: pyserial returns it up to and including `expected`
-        reply = type(self).reply
-        end = reply.find(expected)
-        return reply if end < 0 else reply[: end + len(expected)]
+    def fileno(self):
+        return self.r
 
 
 @pytest.fixture
