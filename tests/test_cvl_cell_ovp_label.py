@@ -81,13 +81,19 @@ def test_a_full_pack_with_no_cell_over_max_is_not_labelled(clock):
     assert b.control_voltage == pytest.approx(b.max_battery_voltage)
 
 
-def test_the_label_clears_at_once_when_the_cells_drop_back_to_max(clock):
-    # the CVL never went below max (the clipped sum was max), so there is no hold or ramp to wait for
+def test_the_limiter_recovers_at_once_and_the_label_clears_after_the_hold(clock):
+    # the CVL never went below max (the clipped sum was max), so there is no limiter hold or ramp to wait for; only the
+    # label is held for CVL_RECOVERY_HOLD_SEC after the last cell over the limit (test_cvl_cell_ovp_label_hold.py)
     b = label_after(clock, [3.47] * 13 + [3.45] * 3)
     for c in b.cells:
         c.voltage = 3.45
     clock[0] += 5
     b.manage_charge_voltage_limit()
-    assert "Cell OVP" not in b.charge_mode
+    assert "Cell OVP" in b.charge_mode
     assert b.control_voltage == pytest.approx(b.max_battery_voltage)
     assert b.control_voltage_last_limit_time is None
+
+    clock[0] += utils.CVL_RECOVERY_HOLD_SEC
+    b.manage_charge_voltage_limit()
+    assert "Cell OVP" not in b.charge_mode
+    assert b.control_voltage == pytest.approx(b.max_battery_voltage)

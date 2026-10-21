@@ -131,7 +131,7 @@ def test_float_transition_labels_a_cell_over_max_and_keeps_ramping(bat, clock):
     assert bat.control_voltage == pytest.approx(before - 0.010)  # the ramp is not disturbed by the label
 
 
-def test_float_label_clears_when_the_cell_is_back_under_max(bat, clock):
+def test_float_label_clears_once_the_cell_was_under_max_for_the_hold(bat, clock):
     reach_float(bat, clock)
     set_cells(bat, HIGH_CELL)
     run(bat, clock, 10)
@@ -139,7 +139,9 @@ def test_float_label_clears_when_the_cell_is_back_under_max(bat, clock):
 
     set_cells(bat, RELAXED)
     run(bat, clock, 5)
+    assert "Cell OVP" in bat.charge_mode  # held for CVL_RECOVERY_HOLD_SEC (test_cvl_cell_ovp_label_hold.py)
 
+    run(bat, clock, utils.CVL_RECOVERY_HOLD_SEC)
     assert bat.charge_mode.startswith("Float")
     assert "Cell OVP" not in bat.charge_mode
     assert bat.control_voltage == pytest.approx(FLOAT_VOLTAGE)
