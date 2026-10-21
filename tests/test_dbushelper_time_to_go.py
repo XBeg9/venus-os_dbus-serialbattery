@@ -28,6 +28,9 @@ MINIMUM_SOC_LIMIT = "/Settings/CGwacs/BatteryLife/MinimumSocLimit"
 LEAVES = (HUB4MODE, STATE, SOC_LIMIT, MINIMUM_SOC_LIMIT)
 
 UNKNOWN_OBJECT = "org.freedesktop.DBus.Error.UnknownObject"
+UNKNOWN_METHOD = "org.freedesktop.DBus.Error.UnknownMethod"
+BUS_ITEM = "com.victronenergy.BusItem"
+INTROSPECTABLE = "org.freedesktop.DBus.Introspectable"
 SOC_LOW_WARNING = 20.0
 
 # the battery under test: 280 Ah at 60 % SoC, discharging at 28 A
@@ -57,6 +60,11 @@ class LocalSettings:
     dictionary) and with the com.victronenergy.Settings interface. Introspect lists those interfaces and the child
     nodes. A path nothing is exported at introspects as a node without them, and GetValue there fails with
     `missing_error`, as libdbus answers (UnknownObject; UnknownMethod from older libdbus).
+
+    On an exported object a method is looked up by interface and name, as dbus-python's service does: GetValue exists
+    only on com.victronenergy.BusItem and Introspect only on org.freedesktop.DBus.Introspectable; anything else fails
+    with UnknownMethod. Stricter than dbus-python, a call without an interface fails too: neither the walk nor the
+    direct read sends one.
     """
 
     def __init__(self, values, failing=None, missing_error=UNKNOWN_OBJECT, unreachable=None):
@@ -65,7 +73,7 @@ class LocalSettings:
         self.missing_error = missing_error
         self.unreachable = unreachable  # (where, error name): the service is gone ("get_object") or does not answer ("call")
         self.get_objects = []  # (path, introspect)
-        self.calls = []  # (member, path)
+        self.calls = []  # (member, interface, path)
 
     def exported(self, path):
         return path in self.values or path in self.failing or any(p.startswith(path + "/") for p in (*self.values, *self.failing))
@@ -78,23 +86,28 @@ class LocalSettings:
             raise dbus.exceptions.DBusException(f"The name {service} was not provided by any .service files", name=self.unreachable[1])
         if introspect:
             # dbus-python's ProxyObject introspects the object itself unless told not to
-            self.calls.append(("Introspect", object_path))
+            self.calls.append(("Introspect", INTROSPECTABLE, object_path))
         return Proxy(self, object_path)
 
-    def call(self, member, path):
-        self.calls.append((member, path))
+    def call(self, member, interface, path):
+        self.calls.append((member, interface, path))
         if self.unreachable and self.unreachable[0] == "call":
             raise dbus.exceptions.DBusException("Did not receive a reply", name=self.unreachable[1])
-        if member == "Introspect":
+        if not self.exported(path):
+            # libdbus answers for a path without an object, whatever the interface
+            if (member, interface) == ("Introspect", INTROSPECTABLE):
+                return self.introspect(path)
+            raise dbus.exceptions.DBusException(f"No such object path '{path}'", name=self.missing_error)
+        if (member, interface) == ("Introspect", INTROSPECTABLE):
             return self.introspect(path)
-        if member == "GetValue" and self.exported(path):
+        if (member, interface) == ("GetValue", BUS_ITEM):
             if path in self.failing:
                 raise dbus.exceptions.DBusException(f"GetValue failed on {path}", name=self.failing[path])
             if path in self.values:
                 return self.values[path]
             prefix = path + "/"
             return dbus.Dictionary({p[len(prefix) :]: v for p, v in self.values.items() if p.startswith(prefix)})
-        raise dbus.exceptions.DBusException(f"No such object path '{path}'", name=self.missing_error)
+        raise dbus.exceptions.DBusException(f"Unknown method: {member} is not a valid method of interface {interface}", name=UNKNOWN_METHOD)
 
     def introspect(self, path):
         prefix = path + "/"
@@ -111,7 +124,7 @@ class Proxy:
         self.path = path
 
     def get_dbus_method(self, member, dbus_interface=None):
-        return lambda *args: self.bus.call(member, self.path)
+        return lambda *args: self.bus.call(member, dbus_interface, self.path)
 
 
 @pytest.fixture
@@ -167,11 +180,12 @@ def test_time_to_go_reads_its_four_settings_without_introspection(publish):
 
     bat, logger, svc = publish(settings)
 
-    assert time_to_go_targets(bat) == [10], "the poll must have recalculated TimeToGo"
-    introspects = [path for member, path in settings.calls if member == "Introspect"]
+    introspects = [path for member, interface, path in settings.calls if member == "Introspect"]
     assert introspects == [], f"one TimeToGo recalculation introspected {len(introspects)} settings objects: {introspects}"
     assert sorted(settings.get_objects) == sorted((leaf, False) for leaf in LEAVES)
-    assert sorted(settings.calls) == sorted(("GetValue", leaf) for leaf in LEAVES)
+    # on another interface localsettings answers UnknownMethod, which reads as a missing setting
+    assert sorted(settings.calls) == sorted(("GetValue", BUS_ITEM, leaf) for leaf in LEAVES)
+    assert time_to_go_targets(bat) == [10], "the poll must have recalculated TimeToGo"
 
 
 # --------------------------------------------------------------------------- which SoC TimeToGo counts down to
@@ -221,7 +235,7 @@ def test_soc_limits_are_truncated_to_whole_percent(publish, soc_limit, minimum_s
 # --------------------------------------------------------------------------- settings that do not exist
 
 
-@pytest.mark.parametrize("missing_error", [UNKNOWN_OBJECT, "org.freedesktop.DBus.Error.UnknownMethod", "org.freedesktop.DBus.Error.UnknownInterface"])
+@pytest.mark.parametrize("missing_error", [UNKNOWN_OBJECT, UNKNOWN_METHOD, "org.freedesktop.DBus.Error.UnknownInterface"])
 @pytest.mark.parametrize(
     "absent",
     [
@@ -262,9 +276,15 @@ def test_get_value_failing_on_an_existing_setting_sets_error_8_and_falls_back(pu
     "unreachable",
     [
         pytest.param(("get_object", "org.freedesktop.DBus.Error.ServiceUnknown"), id="settings service gone"),
+        # every name listed here, not read from dbushelper.DBUS_ERRORS_SERVICE_UNREACHABLE: a name dropped from or
+        # misspelled in that tuple must fail here
         pytest.param(("call", "org.freedesktop.DBus.Error.ServiceUnknown"), id="settings service restarted"),
+        pytest.param(("call", "org.freedesktop.DBus.Error.NameHasNoOwner"), id="settings service has no owner"),
         pytest.param(("call", "org.freedesktop.DBus.Error.NoReply"), id="settings service does not answer"),
+        pytest.param(("call", "org.freedesktop.DBus.Error.Timeout"), id="call timed out (Timeout)"),
+        pytest.param(("call", "org.freedesktop.DBus.Error.TimedOut"), id="call timed out (TimedOut)"),
         pytest.param(("call", "org.freedesktop.DBus.Error.Disconnected"), id="bus connection lost"),
+        pytest.param(("call", "org.freedesktop.DBus.Error.NoServer"), id="no bus server"),
     ],
 )
 def test_an_unreachable_settings_service_skips_this_recalculation(publish, monkeypatch, unreachable):
