@@ -330,6 +330,17 @@ class Seplos(Battery):
             if not Seplos.is_valid_frame(data):
                 return False
 
+            # all packs share the bus and a reply carries the ADR of the pack that sent it: a valid frame from another
+            # pack (e.g. a late reply to its own request) is not the answer to this command and must not be decoded
+            # into this pack
+            if data[3:5] != command[3:5]:
+                logger.warning(
+                    "reply from address {} to a request for address {}, ignored".format(
+                        data[3:5].decode("ascii", errors="replace"), command[3:5].decode("ascii", errors="replace")
+                    )
+                )
+                return False
+
             length_pos = 10
             return_data = data[length_pos + 3 : -5]
             try:
