@@ -26,6 +26,24 @@ VICTRON_SETTINGS_DBUS_NAME = "com.victronenergy.settings"
 # Interface name each path in the settings service exposes in D-Bus introspection XML.
 # Distinct from VICTRON_SETTINGS_DBUS_NAME (the service/bus well-known name, lowercase 's').
 VICTRON_SETTINGS_IFACE_NAME = "com.victronenergy.Settings"
+# Errors of a GetValue sent without introspecting the object first (get_setting_value()).
+# Nothing is exported at the path: libdbus answers UnknownObject (older versions UnknownMethod). The setting does not
+# exist, as when Introspect shows no settings interface there.
+DBUS_ERRORS_NO_SUCH_SETTING = (
+    "org.freedesktop.DBus.Error.UnknownObject",
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+)
+# The service is gone, restarted or does not answer: Introspect fails the same way, before any GetValue.
+DBUS_ERRORS_SERVICE_UNREACHABLE = (
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+    "org.freedesktop.DBus.Error.NameHasNoOwner",
+    "org.freedesktop.DBus.Error.NoReply",
+    "org.freedesktop.DBus.Error.Timeout",
+    "org.freedesktop.DBus.Error.TimedOut",
+    "org.freedesktop.DBus.Error.Disconnected",
+    "org.freedesktop.DBus.Error.NoServer",
+)
 
 _SENTINEL = object()
 
@@ -1394,36 +1412,21 @@ class DbusHelper:
                 # Update TimeToGo item
                 if utils.TIME_TO_GO_ENABLE and percent_per_seconds is not None:
 
-                    # Get settings from dbus
-                    settings_battery_life = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/BatteryLife",
-                    )
-                    settings_hub4mode = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/Hub4Mode",
-                    )
+                    # Get settings from dbus: only the four used here. Walking /Settings/CGwacs/BatteryLife with
+                    # get_settings_with_values() introspects every node below it, 271 ms CPU per pack on a Cerbo GX
+                    settings_bus = get_bus(VICTRON_SETTINGS_DBUS_NAME)
+                    battery_life = {
+                        name: self.get_setting_value(settings_bus, VICTRON_SETTINGS_DBUS_NAME, "/Settings/CGwacs/BatteryLife/" + name)
+                        for name in ("State", "SocLimit", "MinimumSocLimit")
+                    }
+                    hub4mode_value = self.get_setting_value(settings_bus, VICTRON_SETTINGS_DBUS_NAME, "/Settings/CGwacs/Hub4Mode")
 
-                    hub4mode = int(settings_hub4mode["Settings"]["CGwacs"]["Hub4Mode"]) if "Settings" in settings_hub4mode else None
-                    state = (
-                        int(settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]["State"])
-                        if "Settings" in settings_battery_life and "State" in settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]
-                        else None
-                    )
+                    hub4mode = int(hub4mode_value) if hub4mode_value is not None else None
+                    state = int(battery_life["State"]) if battery_life["State"] is not None else None
                     # Venus OS returns SoC limits as float strings (e.g. "15.0"), so int() alone
                     # would raise ValueError; float() parses the decimal first.
-                    minimum_soc_limit = (
-                        int(float(settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]["MinimumSocLimit"]))
-                        if "Settings" in settings_battery_life and "MinimumSocLimit" in settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]
-                        else None
-                    )
-                    soc_limit = (
-                        int(float(settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]["SocLimit"]))
-                        if "Settings" in settings_battery_life and "SocLimit" in settings_battery_life["Settings"]["CGwacs"]["BatteryLife"]
-                        else None
-                    )
+                    minimum_soc_limit = int(float(battery_life["MinimumSocLimit"])) if battery_life["MinimumSocLimit"] is not None else None
+                    soc_limit = int(float(battery_life["SocLimit"])) if battery_life["SocLimit"] is not None else None
 
                     if hub4mode == 1 and state != 9 and minimum_soc_limit is not None and soc_limit is not None:
                         # Optimized without BatteryLife
@@ -1603,6 +1606,34 @@ class DbusHelper:
                         logger.error(f"get_settings_with_values(): Failed to get value: {e}")
 
         return result
+
+    def get_setting_value(self, bus, service: str, object_path: str) -> str:
+        """
+        Get the value of one setting from dbus, without introspection.
+
+        :param bus: The dbus object.
+        :param service: The service name.
+        :param object_path: The object path of the setting.
+        :return: The value as string, as get_settings_with_values() stores it, or None if the setting does not exist.
+        """
+        # introspect=False: dbus-python would otherwise introspect the object before the first call
+        obj = bus.get_object(service, object_path, introspect=False)
+        settings_iface = dbus.Interface(obj, "com.victronenergy.BusItem")
+        method = settings_iface.get_dbus_method("GetValue")
+        try:
+            return str(method())
+        except dbus.exceptions.DBusException as e:
+            if e.get_dbus_name() in DBUS_ERRORS_NO_SUCH_SETTING:
+                return None
+            # get_settings_with_values() gets these from Introspect, which it does not catch either
+            if e.get_dbus_name() in DBUS_ERRORS_SERVICE_UNREACHABLE:
+                raise
+
+            # set error code, to show in the GUI that something is wrong
+            self.battery.manage_error_code(8)
+
+            logger.error(f"get_setting_value(): Failed to get value of {object_path}: {e}")
+            return None
 
     def set_settings(self, bus, service: str, object_path: str, setting_name: str, value) -> bool:
         """
