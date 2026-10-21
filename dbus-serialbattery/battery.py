@@ -1395,6 +1395,29 @@ class Battery(ABC):
         else:
             self.control_allow_discharge = True
 
+    def block_charge_and_discharge(self, reason: str) -> None:
+        """
+        Set CCL and DCL to 0 like the hard stop in `manage_charge_and_discharge_current()`, for when there is no BMS
+        data to run it on. Clearing the hold and ramp state makes the next successful read recover both limits from 0
+        through the usual threshold, hold and ramp instead of resuming a recovery that started before the block.
+
+        :param reason: shown as charge and discharge limitation
+        :return: None
+        """
+        self.control_charge_current = 0
+        self.control_allow_charge = False
+        self.charge_limitation = reason
+        self.ccl_hold_start_time = None
+        self.ccl_ramp_start_time = None
+        self.ccl_ramp_start_value = None
+
+        self.control_discharge_current = 0
+        self.control_allow_discharge = False
+        self.discharge_limitation = reason
+        self.dcl_hold_start_time = None
+        self.dcl_ramp_start_time = None
+        self.dcl_ramp_start_value = None
+
     def calc_max_charge_current_from_cell_voltage(self) -> float:
         """
         Calculate the maximum charge current referring to the cell voltage.

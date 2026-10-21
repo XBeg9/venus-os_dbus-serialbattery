@@ -226,3 +226,128 @@ def test_the_logged_band_check_matches_the_decision(env, monkeypatch):
     assert any("Cell voltages are in a safe threshold" in line for line in lines), lines
     assert any("Min cell voltage: 3.225 >= Min Threshold: 3.225 --> OK" in line for line in lines), lines
     assert any("Max cell voltage: 3.450 <= Max threshold: 3.450 --> OK" in line for line in lines), lines
+
+
+# --------------------------------------------------------------------------- blocking while the pack is silent
+
+BLOCKED = (0, 0, 0, 0)
+OFFLINE_AFTER = 10  # s after the first failed poll publish_battery marks the battery offline (RETRY_CYCLE_SHORT_COUNT)
+
+
+def connect(clock, link, helper, loop, cells_mv):
+    link.answer(cells_mv)
+    helper.publish_battery(loop)
+    svc = helper._dbusservice
+    assert helper.battery.online is True and svc["/Connected"] == 1
+    before = limits(svc)
+    assert before[0] > 0 and before[1] > 0 and before[2:] == (1, 1), before
+    return before
+
+
+@pytest.mark.parametrize(
+    "cells_mv",
+    [
+        pytest.param([3400] * 15 + [3460], id="top cell above the band"),
+        pytest.param([3200] + [3300] * 15, id="bottom cell below the band"),
+    ],
+)
+def test_offline_with_cells_outside_the_safe_band_blocks_charge_and_discharge(env, cells_mv):
+    # config.default.ini: "If cell voltages are outside that range, the driver blocks charge and discharge and exits
+    # after 60 seconds." manage_charge_and_discharge_current() only runs on a good read, so the last limits and
+    # AllowTo* = 1 stayed on D-Bus for those 60 s, and dbus-aggregate-batteries (Controlling BMS) kept using them.
+    clock, link, bat, helper, svc, loop = env
+    before = connect(clock, link, helper, loop, cells_mv)
+
+    rows = go_silent(clock, link, helper, loop, 60)  # failed polls 0 .. 55 s after the first
+
+    assert helper.cell_voltages_good is False and bat.online is False
+    loop.quit.assert_not_called()
+    assert [r for r in rows if r[0] < OFFLINE_AFTER] == [(t, before) for t in (0, 5)]
+    assert [r for r in rows if r[0] >= OFFLINE_AFTER] == [(t, BLOCKED) for t in range(OFFLINE_AFTER, 60, POLL)]
+    assert svc["/Connected"] == 0
+
+    go_silent(clock, link, helper, loop, POLL)  # 60 s: the documented exit, still blocked
+    loop.quit.assert_called_once()
+    assert limits(svc) == BLOCKED
+
+
+def test_block_on_disconnect_blocks_charge_and_discharge_whatever_the_cells(env, monkeypatch):
+    # config.default.ini, BLOCK_ON_DISCONNECT = True: "Charge and discharge are blocked immediately on BMS communication
+    # loss." The driver can only tell a lost link from a missed reply after two failed polls, at the offline mark.
+    monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", True)
+    clock, link, bat, helper, svc, loop = env
+    before = connect(clock, link, helper, loop, [3300] * CELLS)  # well inside the band
+
+    rows = go_silent(clock, link, helper, loop, 60)
+
+    loop.quit.assert_not_called()
+    assert [r for r in rows if r[0] < OFFLINE_AFTER] == [(t, before) for t in (0, 5)]
+    assert [r for r in rows if r[0] >= OFFLINE_AFTER] == [(t, BLOCKED) for t in range(OFFLINE_AFTER, 60, POLL)]
+    assert svc["/Connected"] == 0
+
+    go_silent(clock, link, helper, loop, POLL)
+    loop.quit.assert_called_once()
+
+
+def test_offline_inside_the_safe_band_rides_through_until_the_timeout(env):
+    # BLOCK_ON_DISCONNECT = False and cells in the band: "charge and discharge continue for
+    # BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES minutes (default: 30) before the driver exits"
+    clock, link, bat, helper, svc, loop = env
+    before = connect(clock, link, helper, loop, [3300] * CELLS)
+
+    rows = go_silent(clock, link, helper, loop, 30 * 60)
+
+    loop.quit.assert_not_called()
+    assert [r for r in rows if r[1] != before] == []
+    assert bat.online is False and svc["/Connected"] == 0  # the GUI shows the lost link even while riding through
+
+    go_silent(clock, link, helper, loop, POLL)
+    loop.quit.assert_called_once()
+
+
+def test_limits_recover_from_zero_through_hold_and_ramp_after_a_blocked_outage(env, monkeypatch):
+    # After the block the limits restart from 0 like after any other hard stop: CCL holds CCL_RECOVERY_HOLD_SEC
+    # (120 s) and ramps at CCL_RECOVERY_RATE_A_PER_SEC (0.10 A/s), DCL holds DCL_RECOVERY_HOLD_SEC (30 s) and ramps at
+    # DCL_RECOVERY_RATE_A_PER_SEC (5 A/s), so a link that is not stable again does not toggle the bank on and off.
+    monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", True)
+    clock, link, bat, helper, svc, loop = env
+    cells = [3300] * CELLS  # CCL 70 A, DCL 140 A from the cell-voltage tables
+    assert connect(clock, link, helper, loop, cells) == (70, 140, 1, 1)
+    go_silent(clock, link, helper, loop, 30)
+    assert limits(svc) == BLOCKED
+
+    link.answer(cells)
+    t_back = clock.t + POLL
+    seen = {}
+    for _ in range(900 // POLL):
+        clock.t += POLL
+        helper.publish_battery(loop)
+        seen[clock.t - t_back] = (bat.online, svc["/Connected"]) + limits(svc)
+    loop.quit.assert_not_called()
+
+    assert seen[0] == (True, 1) + BLOCKED  # /Connected follows online at once, the limits do not
+    assert all(seen[t][2] == 0 and seen[t][4] == 0 for t in seen if t < 120)  # CCL hold
+    assert all(seen[t][3] == 0 and seen[t][5] == 0 for t in seen if t < 30)  # DCL hold
+    assert seen[60][3:] == (140, 0, 1)  # DCL back in full 28 s after its hold
+    assert seen[200][2] == pytest.approx(8.0) and seen[200][4] == 1  # CCL ramping: 80 s at 0.10 A/s
+    assert seen[895][2:] == (70, 140, 1, 1)  # CCL back in full 700 s after its hold
+
+
+def test_a_pack_that_answers_briefly_between_silences_is_blocked_again_at_once(env):
+    # The offline mark is set once per error episode (error["cleared"] only returns after 60 s without errors), so a
+    # pack that answered for a while in between is not marked offline again; its next failed poll must still block.
+    clock, link, bat, helper, svc, loop = env
+    cells = [3400] * 15 + [3460]  # top cell above the band
+    connect(clock, link, helper, loop, cells)
+    go_silent(clock, link, helper, loop, 15)  # failed polls 0, 5, 10 s: offline and blocked
+    assert limits(svc) == BLOCKED
+
+    link.answer(cells)
+    for _ in range(8):  # good polls 15 .. 50 s: DCL holds 30 s, then ramps
+        clock.t += POLL
+        helper.publish_battery(loop)
+    assert svc["/Info/MaxDischargeCurrent"] > 0 and svc["/Io/AllowToDischarge"] == 1
+
+    go_silent(clock, link, helper, loop, POLL)  # 55 s after the first failed poll of this episode
+    loop.quit.assert_not_called()
+    assert limits(svc) == BLOCKED

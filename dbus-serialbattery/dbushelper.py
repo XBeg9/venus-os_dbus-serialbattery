@@ -1083,6 +1083,14 @@ class DbusHelper:
 
                             self.battery.init_values()
 
+                        # Block as documented for BLOCK_ON_DISCONNECT and for cells outside the safe band.
+                        # manage_charge_and_discharge_current() only runs on a successful read, so without this the
+                        # last limits and AllowTo* = 1 stay published until the driver exits, and consumers like
+                        # dbus-aggregate-batteries keep using them. Done on every failed poll, not only when the battery
+                        # is marked offline, so a pack that answered once in between is blocked again.
+                        if utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good:
+                            self.battery.block_charge_and_discharge("BMS not responding")
+
                     # set connection info
                     remaining = self.disconnect_threshold - time_since_first_error
                     self.battery.connection_info = (
@@ -1225,6 +1233,9 @@ class DbusHelper:
         self._dbusservice["/Io/AllowToHeat"] = 1 if self.battery.get_allow_to_heat() else 0 if self.battery.get_allow_to_heat() is not None else None
         self._dbusservice["/System/NrOfModulesBlockingCharge"] = 0 if self.battery.get_allow_to_charge() else 1
         self._dbusservice["/System/NrOfModulesBlockingDischarge"] = 0 if self.battery.get_allow_to_discharge() else 1
+        # online is None until the first successful poll; detection read the BMS just before, so stay connected until
+        # publish_battery marks the battery offline
+        self._dbusservice["/Connected"] = 0 if self.battery.online is False else 1
         self._dbusservice["/System/NrOfModulesOnline"] = 1 if self.battery.online else 0
         self._dbusservice["/System/NrOfModulesOffline"] = 0 if self.battery.online else 1
         self._dbusservice["/System/MinCellTemperature"] = self.battery.get_min_temperature()
