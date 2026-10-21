@@ -774,6 +774,7 @@ class Battery(ABC):
 
                 # Get maximum allowed cell voltage
                 cell_voltage_max_allowed = utils.SOC_RESET_CELL_VOLTAGE if self.soc_reset_requested else utils.MAX_CELL_VOLTAGE
+                cell_over_max = self.get_max_cell_voltage() > cell_voltage_max_allowed
 
                 # use P-Controller
                 if utils.CVL_CONTROLLER_MODE == 1:
@@ -850,9 +851,13 @@ class Battery(ABC):
                 # Recover slowly the voltage, if needed
                 # Set control voltage immediately, if not reduced by the controller
                 # and nothing to recover, or the stored limit is already at or above max (max can drop at runtime:
-                # end of a SoC reset, BMS supplied values), else the "<=" branch below re-limits at max for good
-                if control_voltage >= self.max_battery_voltage and (
-                    self.control_voltage_last_limit_time is None or (self.control_voltage is not None and self.control_voltage >= max_voltage)
+                # end of a SoC reset, BMS supplied values), else the "<=" branch below re-limits at max for good.
+                # Never while a cell is over the limit: with every cell at or above it the clipped sum is max in exact
+                # arithmetic, and whether the float sum lands an ulp above or below max must not decide the label
+                if (
+                    not cell_over_max
+                    and control_voltage >= self.max_battery_voltage
+                    and (self.control_voltage_last_limit_time is None or (self.control_voltage is not None and self.control_voltage >= max_voltage))
                 ):
                     self.control_voltage = max_voltage
                     self.control_voltage_last_limit_time = None
