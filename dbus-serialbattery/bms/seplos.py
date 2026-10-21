@@ -6,8 +6,51 @@
 
 from battery import Protection, Battery, Cell
 from utils import SOC_CALCULATION, get_connection_error_message, logger, capture_raw_data
+import errno
+import os
+import select
 import serial
 import sys
+import time
+
+# seconds from the command written to the end of its reply: the port's read timeout (timeout=1), which bounded the
+# read before, so a frame that is cut short still waits the same 1 s. Module level so the tests can shorten it.
+REPLY_TIMEOUT = 1.0
+
+
+def read_frame(ser) -> bytes:
+    """
+    Read a reply up to and including its first CR, or what arrived within REPLY_TIMEOUT.
+
+    pyserial's read_until(b"\\r") loops read(1): a select, an os.read and the timeout bookkeeping for every byte, 28-33 ms
+    CPU per command on the Cerbo. This takes what has arrived in one os.read per wake-up, 6-10 ms per command. The
+    errors are those of pyserial 3.5's Serial.read, so the callers see the same exceptions as before.
+    """
+    fd = ser.fileno()
+    deadline = time.monotonic() + REPLY_TIMEOUT
+    data = b""
+    while True:
+        end = data.find(b"\r")
+        if end >= 0:
+            # the port is closed right after and the next command flushes its input: what follows the CR is dropped
+            return data[: end + 1]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return data
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                return data
+            chunk = os.read(fd, 512)
+        except OSError as e:
+            # pyserial opens the port O_NONBLOCK: a read after select can still find nothing
+            if e.errno in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
+                continue
+            raise serial.SerialException("read failed: {}".format(e))
+        if not chunk:
+            # a disconnected adapter stays readable but returns nothing: without this the loop spins until the deadline
+            raise serial.SerialException("device reports readiness to read but returned no data (device disconnected or multiple access on port?)")
+        data += chunk
 
 
 class Seplos(Battery):
@@ -323,8 +366,8 @@ class Seplos(Battery):
 
             # a Seplos frame ends with EOI CR: readline() only stops at LF, so every command waited out the full timeout
             # (about 4 s of each 5 s poll for two packs). The timeout still ends a frame that is cut short; the checksum
-            # and the callers' info length check reject it.
-            data = ser.read_until(b"\r")
+            # and the callers' info length check reject it. read_frame reads it in chunks, read_until byte by byte.
+            data = read_frame(ser)
             capture_raw_data(self.port, "rx", data)
 
             if not Seplos.is_valid_frame(data):
