@@ -49,25 +49,56 @@ class _CachedDbusProxy:
     the write to the real service when the new value differs from the
     last written one, eliminating the majority of D-Bus traffic while
     remaining fully transparent for reads and method calls.
+
+    Used as a context manager (``with proxy:``) it batches the writes:
+    they go to a velib ServiceContext, which emits all changed paths in
+    one ItemsChanged signal at the end instead of one PropertiesChanged
+    per path.
     """
 
-    __slots__ = ("_svc", "_cache")
+    __slots__ = ("_svc", "_cache", "_batch", "_batch_depth")
 
     def __init__(self, svc):
         self._svc = svc
         self._cache: dict = {}
+        # velib ServiceContext of the open batch, None outside one. Set here: with __slots__ an unset slot would fall
+        # through to __getattr__ and read the service's attribute instead
+        self._batch = None
+        self._batch_depth: int = 0
 
     def __setitem__(self, path, value):
         prev = self._cache.get(path, _SENTINEL)
         if prev is not value and prev != value:
             self._cache[path] = value
-            self._svc[path] = value
+            (self._svc if self._batch is None else self._batch)[path] = value
 
     def __getitem__(self, path):
+        # the service, also during a batch: the context sets each item's value at once and only defers the signal
         return self._svc[path]
+
+    def __contains__(self, path):
+        return path in self._svc
 
     def __getattr__(self, name):
         return getattr(self._svc, name)
+
+    def __enter__(self):
+        # Python looks __enter__/__exit__ up on the type, so __getattr__ never forwards them to the service.
+        # A nested batch joins the open one: everything up to the outermost exit goes out in one ItemsChanged.
+        # A service without velib's context support (VeDbusService.__enter__) keeps per-path writes.
+        if self._batch_depth == 0 and hasattr(type(self._svc), "__enter__"):
+            self._batch = self._svc.__enter__()
+        self._batch_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        self._batch_depth -= 1
+        if self._batch_depth == 0 and self._batch is not None:
+            # back to per-path writes before the flush, so a flush that raises cannot leave the proxy in a closed batch
+            self._batch = None
+            # velib pops the context and emits its changes, also when the body raised; the exception still propagates
+            self._svc.__exit__(*exc)
+        return False
 
 
 class SystemBus(dbus.bus.BusConnection):
@@ -1155,6 +1186,18 @@ class DbusHelper:
     def publish_dbus(self) -> None:
         """
         Publishes the battery data to dbus and refresh it.
+        """
+        # One ItemsChanged per poll instead of one PropertiesChanged per changed path (Cerbo, 2 packs: 41 signals and
+        # 38 ms CPU per poll became 2 and 21.5 ms), and a consumer gets all of a poll's paths at once. Signal by signal,
+        # dbus-aggregate-batteries was seen with /Info/MaxChargeVoltage and /Info/ChargeMode from different polls.
+        # The block on a silent pack (limits and AllowTo* = 0, /Connected = 0) is set on the battery object and
+        # written here, so it is in the same signal.
+        with self._dbusservice:
+            self._publish_dbus_values()
+
+    def _publish_dbus_values(self) -> None:
+        """
+        Writes the battery data to the dbus service; publish_dbus() runs it inside one batch.
         """
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
         if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
