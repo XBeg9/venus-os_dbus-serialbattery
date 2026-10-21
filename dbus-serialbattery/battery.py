@@ -844,10 +844,18 @@ class Battery(ABC):
 
                 self.charge_mode = "Bulk" if self.max_voltage_start_time is None else "Absorption"
 
+                # max battery voltage as it gets stored
+                max_voltage = round(self.max_battery_voltage, 6)
+
                 # Recover slowly the voltage, if needed
                 # Set control voltage immediately, if not reduced by the controller
-                if control_voltage >= self.max_battery_voltage and self.control_voltage_last_limit_time is None:
-                    self.control_voltage = round(self.max_battery_voltage, 6)
+                # and nothing to recover, or the stored limit is already at or above max (max can drop at runtime:
+                # end of a SoC reset, BMS supplied values), else the "<=" branch below re-limits at max for good
+                if control_voltage >= self.max_battery_voltage and (
+                    self.control_voltage_last_limit_time is None or (self.control_voltage is not None and self.control_voltage >= max_voltage)
+                ):
+                    self.control_voltage = max_voltage
+                    self.control_voltage_last_limit_time = None
                     self.control_voltage_ramp_base = None
 
                 # Set control voltage immediately, if control voltage is lower than previous control voltage
@@ -885,11 +893,16 @@ class Battery(ABC):
                         self.charge_mode += " (Cell OVP*)"  # Cell over voltage protection
 
                     # If control voltage reached max battery voltage, reset timers
-                    if allowed_voltage == self.max_battery_voltage:
+                    # Compare both sides rounded the way they get stored: a ramp one float step short of max
+                    # (54.98 + 0.220 = 55.199999999999996) is stored as max, and a max off the rounding grid
+                    # (12 x 3.45 = 41.400000000000006) is never reached by a stored value. If it does not count as
+                    # reached, the limit time stays set and the "<=" branch above re-limits at max ("Cell OVP" for good)
+                    allowed_voltage = round(allowed_voltage, 6)
+                    if allowed_voltage >= max_voltage:
                         self.control_voltage_last_limit_time = None
                         self.control_voltage_ramp_base = None
 
-                    self.control_voltage = round(allowed_voltage, 6)
+                    self.control_voltage = allowed_voltage
 
                 if self.max_battery_voltage == self.soc_reset_battery_voltage:
                     self.charge_mode += " & SoC Reset"
