@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 import requests
 import threading
 import json
+from typing import Union
 
 # add path to velib_python
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
@@ -1681,7 +1682,7 @@ class DbusHelper:
 
         return result
 
-    def get_setting_value(self, bus, service: str, object_path: str) -> str:
+    def get_setting_value(self, bus, service: str, object_path: str) -> Union[str, None]:
         """
         Get the value of one setting from dbus, without introspection.
 
