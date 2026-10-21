@@ -968,6 +968,13 @@ class Battery(ABC):
                 else:
                     self.control_voltage = float_voltage
 
+                # Signal a cell over the limit in float too: the CVL is already the float voltage, but consumers that
+                # combine several packs (dbus-aggregate-batteries KEEP_MAX_CVL) only take the lowest CVL when a pack
+                # says "Cell OVP", else a pack in float is charged at another pack's bulk voltage. Appended after the
+                # mode, so the startswith("Float") / ("Float Transition") checks above still see the state.
+                if self.get_max_cell_voltage() > utils.MAX_CELL_VOLTAGE:
+                    charge_mode += " (Cell OVP)"
+
                 self.charge_mode = charge_mode
 
             if utils.CHARGE_MODE == 2:
