@@ -709,8 +709,11 @@ class Battery(ABC):
             clipped_coltage = 0
 
         try:
-            voltage_sum = self.get_cell_voltage_sum()
-            voltage_cell_diff = self.get_max_cell_voltage() - self.get_min_cell_voltage()
+            # Rounded, since both are compared with configured limits below: cell voltages like 3.451 and 3.441 V give
+            # a difference of 0.010000000000000231 (not <= 0.010) and 16 cells totalling 55.200 V can sum to
+            # 55.199999999999996 (not >= 55.2), so a documented boundary would be on either side by float rounding
+            voltage_sum = round(self.get_cell_voltage_sum(), 6)
+            voltage_cell_diff = round(self.get_max_cell_voltage() - self.get_min_cell_voltage(), 6)
 
             if self.max_voltage_start_time is None:
                 # start timer, if max voltage is reached and cells are balanced
@@ -741,7 +744,7 @@ class Battery(ABC):
 
             # timer started
             else:
-                if voltage_cell_diff > (utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DIFF + utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DEVIATION):
+                if voltage_cell_diff > round(utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DIFF + utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DEVIATION, 6):
                     self.max_voltage_start_time = current_time
 
                 time_diff = current_time - self.max_voltage_start_time
