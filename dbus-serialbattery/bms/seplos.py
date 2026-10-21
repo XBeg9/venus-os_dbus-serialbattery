@@ -13,8 +13,10 @@ import serial
 import sys
 import time
 
-# seconds from the command written to the end of its reply: the port's read timeout (timeout=1), which bounded the
-# read before, so a frame that is cut short still waits the same 1 s. Module level so the tests can shorten it.
+# seconds from the start of read_frame (just after the command is written) to the end of its reply; also the port's
+# timeout, so there is one setting. read_until gave every read(1) this timeout on top of its own, so bytes that kept
+# trickling in could stretch a read to about 2 s; a cut-short frame still waits 1 s. Module level so the tests can
+# shorten it.
 REPLY_TIMEOUT = 1.0
 
 
@@ -22,9 +24,10 @@ def read_frame(ser) -> bytes:
     """
     Read a reply up to and including its first CR, or what arrived within REPLY_TIMEOUT.
 
-    pyserial's read_until(b"\\r") loops read(1): a select, an os.read and the timeout bookkeeping for every byte, 28-33 ms
-    CPU per command on the Cerbo. This takes what has arrived in one os.read per wake-up, 6-10 ms per command. The
-    errors are those of pyserial 3.5's Serial.read, so the callers see the same exceptions as before.
+    pyserial's read_until(b"\\r") loops read(1): a select, an os.read and the timeout bookkeeping for every byte, 28-34 ms
+    CPU per command on the Cerbo. This takes what has arrived in one os.read per wake-up: 6.3 ms on the Cerbo with the
+    FTDI's ~30-byte chunks, 11 ms with 8-byte chunks (measured 2026-10-21). The errors are those of pyserial 3.5's
+    Serial.read, so the callers see the same exceptions as before.
     """
     fd = ser.fileno()
     deadline = time.monotonic() + REPLY_TIMEOUT
@@ -357,7 +360,7 @@ class Seplos(Battery):
     def read_serial_data_seplos(self, command):
         logger.debug("read serial data seplos")
 
-        with serial.Serial(self.port, baudrate=self.baud_rate, timeout=1) as ser:
+        with serial.Serial(self.port, baudrate=self.baud_rate, timeout=REPLY_TIMEOUT) as ser:
             ser.flushOutput()
             ser.flushInput()
             written = ser.write(command)

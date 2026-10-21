@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 import requests
 import threading
 import json
+from typing import Union
 
 # add path to velib_python
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
@@ -1234,10 +1235,14 @@ class DbusHelper:
         # health_check_battery on the GLib loop; the proxy's lock makes the second one wait for the first batch to close.
         with self._dbusservice:
             self._publish_dbus_values()
+        # After the flush: the tail makes blocking calls to com.victronenergy.settings (up to libdbus's 25 s reply
+        # timeout each if localsettings hangs). Inside the batch they held back this poll's limits, AllowTo* and
+        # /Connected and held the proxy's lock. The tail writes only /TimeToGo, /TimeToSoC/* and /JsonData, per path.
+        self._publish_dbus_tail()
 
     def _publish_dbus_values(self) -> None:
         """
-        Writes the battery data to the dbus service; publish_dbus() runs it inside one batch.
+        Writes the battery data to the dbus service; publish_dbus() runs it inside one batch. No D-Bus calls here.
         """
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
         if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
@@ -1460,6 +1465,11 @@ class DbusHelper:
 
         self._dbusservice["/CurrentAvg"] = self.battery.current_avg
 
+    def _publish_dbus_tail(self) -> None:
+        """
+        The part of publish_dbus() that calls com.victronenergy.settings (TimeToGo, settings save, LastSeen), with the
+        history, cell log and JSON export; runs after the batch of _publish_dbus_values() is signalled.
+        """
         # Update TimeToGo and/or TimeToSoC
         try:
             # if Time-To-Go or Time-To-SoC is enabled
@@ -1672,7 +1682,7 @@ class DbusHelper:
 
         return result
 
-    def get_setting_value(self, bus, service: str, object_path: str) -> str:
+    def get_setting_value(self, bus, service: str, object_path: str) -> Union[str, None]:
         """
         Get the value of one setting from dbus, without introspection.
 
