@@ -837,8 +837,9 @@ class Battery(ABC):
                                     clipped_coltage += voltage
 
                     if found_high_cell_voltage:
-                        # add little voltage to keep charging
-                        control_voltage = clipped_coltage + 0.010
+                        # add little voltage to keep charging, but never above max battery voltage (as modes 1 and 2):
+                        # with every cell at or above the limit this would be max + 0.010 V
+                        control_voltage = min(clipped_coltage + 0.010, self.max_battery_voltage)
                     else:
                         control_voltage = self.max_battery_voltage
 
