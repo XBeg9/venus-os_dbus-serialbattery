@@ -686,25 +686,34 @@ def main():
             lambda: poll_battery(mainloop),
         )
 
+    # consecutive good retries of a missing address before restarting to add it
+    retry_answers_needed = 3
+    retry_answers = {address: 0 for address in missing_addresses}
+
     def retry_missing_batteries() -> bool:
         """
         Try the configured addresses that did not answer during start-up again, one connection test each, so the
         batteries that were found keep being polled in between. Nothing else ever probes them again, and with one
-        battery working the driver never exits. Once a missing one answers, quit the main loop: the service restarts
-        the driver, which then sets up all batteries.
+        battery working the driver never exits. Once a missing one has answered retry_answers_needed retries in a row,
+        quit the main loop: the service restarts the driver, which then sets up all batteries. One answer is not
+        enough: each restart takes every battery service off D-Bus for about 20 s, and a battery on a marginal link
+        that answers now and then would otherwise be missed again at start-up and restart the driver every few minutes.
 
         :return: True to keep the timer, False once the driver is restarting
         """
         for address in missing_addresses:
             found = battery[first_key]
+            answered = False
             # noinspection PyBroadException
             try:
                 candidate = type(found)(port=port, baud=found.baud_rate, address=bytes.fromhex(address.replace("0x", "")))
-                if candidate.test_connection() and candidate.validate_data():
-                    quit_mainloop_then_log(mainloop, logger.info, f"Battery at {port} and address {address} answers now, restarting to add it")
-                    return False
+                answered = candidate.test_connection() and candidate.validate_data()
             except Exception:
                 logger.exception(f"Retrying the battery at {port} and address {address} failed")
+            retry_answers[address] = retry_answers[address] + 1 if answered else 0
+            if retry_answers[address] >= retry_answers_needed:
+                quit_mainloop_then_log(mainloop, logger.info, f"Battery at {port} and address {address} answers again, restarting to add it")
+                return False
         return True
 
     if missing_addresses:

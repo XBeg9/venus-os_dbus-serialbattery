@@ -129,8 +129,9 @@ def test_an_address_missing_at_start_up_is_retried_and_picked_up(driver, monkeyp
         f"0x01 answered again at 600 s but after an hour only {sorted({a for _, a in polled})} is served "
         f"({len(retries)} retries of 0x01) and the driver did not exit to restart with both"
     )
-    # picked up within a retry interval of answering again, by quitting the loop so the service restarts the driver
-    assert 600 <= sim.quit_at <= 600 + 60 + 5
+    # picked up after three retries in a row answered (test_startup_flaky_battery.py), by quitting the loop so the
+    # service restarts the driver
+    assert 600 <= sim.quit_at <= 600 + 3 * 60 + 5
     # the healthy pack kept being polled meanwhile, and the retries were single attempts, not a full re-detection
     assert len([t for t, a in polled if a == "0x00" and 0 < t < 600]) >= 100
     assert len([t for t in retries if t < 600]) <= 600 / 60 + 1
