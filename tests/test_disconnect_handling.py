@@ -389,6 +389,65 @@ def test_limits_recover_from_zero_through_hold_and_ramp_after_a_blocked_outage(e
     assert seen[895][2:] == (70, 140, 1, 1)  # CCL back in full 700 s after its hold
 
 
+@pytest.mark.parametrize(
+    "cells_mv, block_on_disconnect",
+    [
+        pytest.param([3300] * CELLS, True, id="BLOCK_ON_DISCONNECT"),
+        pytest.param([3200] + [3300] * 15, False, id="bottom cell below the band"),
+    ],
+)
+def test_an_outage_during_the_ccl_ramp_starts_the_ccl_hold_again(env, monkeypatch, cells_mv, block_on_disconnect):
+    # A second outage while CCL is still ramping back from the first. The block drops the hold and ramp state, so the
+    # reconnect holds CCL at 0 for CCL_RECOVERY_HOLD_SEC again. With the old ramp start kept, the ramp went on counting
+    # through the outage and CCL came back at once at the value it would have reached without one.
+    monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", block_on_disconnect)
+    clock, link, bat, helper, svc, loop = env
+    connect(clock, link, helper, loop, cells_mv)
+    poll(clock, link, helper, loop, cells_mv, "x" * 6 + "." * 60)  # blocked from 10 s, then back for 300 s
+    assert 0 < svc["/Info/MaxChargeCurrent"] < 70  # past the 120 s hold, ramping
+
+    rows = poll(clock, link, helper, loop, cells_mv, "x" * 6 + "." * 40)  # blocked again from 10 s, back from 30 s
+
+    loop.quit.assert_not_called()
+    ccl = dict((t - 30, lim[0]) for t, lim in rows if t >= 30)  # by seconds since the reconnect
+    assert [ccl[t] for t in range(0, 120, POLL)] == [0] * 24
+    assert ccl[195] == pytest.approx(7.5)  # then ramps from 0 at 0.10 A/s
+
+
+def test_an_outage_during_the_dcl_ramp_starts_the_dcl_hold_again(env):
+    # DCL is ramping back up after a low cell under load when the pack falls silent; the bottom cell is still below the
+    # band, so the pack is blocked. The reconnect must hold DCL at 0 for DCL_RECOVERY_HOLD_SEC again. With the old ramp
+    # start kept, DCL was back at 140 A on the first good poll, no hold.
+    clock, link, bat, helper, svc, loop = env
+    connect(clock, link, helper, loop, [3000] + [3300] * 15)
+    assert svc["/Info/MaxDischargeCurrent"] == 35  # 3.000 V in the cell-voltage table
+    cells = [3200] + [3300] * 15  # recovered: 140 A from the table, but still below the band
+    poll(clock, link, helper, loop, cells, "." * 9)  # 30 s hold, then 10 s at 5 A/s from 35 A
+    assert svc["/Info/MaxDischargeCurrent"] == 85
+
+    rows = poll(clock, link, helper, loop, cells, "xxx" + "." * 10)  # blocked at 10 s, back from 15 s
+
+    loop.quit.assert_not_called()
+    assert [lim[1] for t, lim in rows] == [85, 85, 0] + [0] * 7 + [25, 50, 75]  # 30 s hold from 15 s, then 5 A/s
+
+
+def test_with_the_holds_set_to_0_an_outage_during_the_ramps_ramps_again_from_0(env, monkeypatch):
+    # config.default.ini: "Set CCL_RECOVERY_HOLD_SEC / DCL_RECOVERY_HOLD_SEC to 0 to skip the hold period." Without a
+    # hold the reconnect goes straight to the ramp, so it is the dropped ramp start that makes the ramp begin again
+    # from 0 instead of resuming the one that started before the outage.
+    monkeypatch.setattr(utils, "CCL_RECOVERY_HOLD_SEC", 0)
+    monkeypatch.setattr(utils, "DCL_RECOVERY_HOLD_SEC", 0)
+    clock, link, bat, helper, svc, loop = env
+    cells = [3200] + [3300] * 15  # bottom cell below the band
+    connect(clock, link, helper, loop, cells)
+
+    # blocked at 10 s, ramping from 15 s, silent again 35..45 s and blocked again, back from 50 s
+    rows = poll(clock, link, helper, loop, cells, "xxx" + "...." + "xxx" + "....")
+
+    loop.quit.assert_not_called()
+    assert [lim[:2] for t, lim in rows if t >= 30] == [(1.5, 75), (1.5, 75), (1.5, 75), (0, 0), (0, 0), (0.5, 25), (1.0, 50), (1.5, 75)]
+
+
 def test_a_pack_that_answers_between_silences_is_blocked_again_when_it_falls_silent_again(env):
     # The offline mark is set once per error episode (error["cleared"] only returns after 60 s without errors), so a
     # pack that answered for a while in between is not marked offline again; 10 s into its next silence it must still
