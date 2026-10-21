@@ -417,6 +417,8 @@ def main():
 
     port = get_port()
     battery = {}
+    # configured serial addresses that did not answer during start-up, retried from the main loop
+    missing_addresses = []
 
     # BLUETOOTH
     if port.endswith("_Ble"):
@@ -621,6 +623,7 @@ def main():
                     logger.info(f"Successful battery connection at {port} and this address {address}")
                 else:
                     logger.warning(f"No battery connection at {port} and this address {address}")
+            missing_addresses = [address for address in BATTERY_ADDRESSES if address not in battery]
         # Use default address
         else:
             battery[0] = get_battery(port)
@@ -682,6 +685,31 @@ def main():
             battery[first_key].poll_interval,
             lambda: poll_battery(mainloop),
         )
+
+    def retry_missing_batteries() -> bool:
+        """
+        Try the configured addresses that did not answer during start-up again, one connection test each, so the
+        batteries that were found keep being polled in between. Nothing else ever probes them again, and with one
+        battery working the driver never exits. Once a missing one answers, quit the main loop: the service restarts
+        the driver, which then sets up all batteries.
+
+        :return: True to keep the timer, False once the driver is restarting
+        """
+        for address in missing_addresses:
+            found = battery[first_key]
+            # noinspection PyBroadException
+            try:
+                candidate = type(found)(port=port, baud=found.baud_rate, address=bytes.fromhex(address.replace("0x", "")))
+                if candidate.test_connection() and candidate.validate_data():
+                    quit_mainloop_then_log(mainloop, logger.info, f"Battery at {port} and address {address} answers now, restarting to add it")
+                    return False
+            except Exception:
+                logger.exception(f"Retrying the battery at {port} and address {address} failed")
+        return True
+
+    if missing_addresses:
+        logger.warning(f"Retrying the battery at {port} and address(es) {', '.join(missing_addresses)} every 60 s")
+        GLib.timeout_add_seconds(60, retry_missing_batteries)
 
     # print log at this point, else not all data is correctly populated
     for key_address in battery:
