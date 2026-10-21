@@ -631,19 +631,21 @@ class DbusHelper:
             self.battery.min_battery_voltage,
             writeable=True,
         )
+        # The service is on D-Bus with /Connected = 1 from here, but max_battery_voltage is only set by
+        # manage_charge_voltage on the first good poll. Register the charge voltage it starts from, else
+        # dbus-aggregate-batteries reads a None CVL for this pack and has no bank CVL until then
+        max_battery_voltage = self.battery.max_battery_voltage
+        if max_battery_voltage is None and self.battery.cell_count is not None:
+            max_battery_voltage = round(utils.MAX_CELL_VOLTAGE * self.battery.cell_count, 2)
         self._dbusservice.add_path(
             "/Info/MaxChargeVoltage",
-            self.battery.max_battery_voltage,
+            max_battery_voltage,
             writeable=True,
             gettextcallback=lambda p, v: "{:0.2f}V".format(v),
         )
         self._dbusservice.add_path(
             "/Info/MaxChargeCellVoltage",
-            (
-                round(self.battery.max_battery_voltage / self.battery.cell_count, 3)
-                if self.battery.max_battery_voltage is not None and self.battery.cell_count is not None
-                else None
-            ),
+            (round(max_battery_voltage / self.battery.cell_count, 3) if max_battery_voltage is not None and self.battery.cell_count is not None else None),
             writeable=True,
             gettextcallback=lambda p, v: "{:0.2f}V".format(v),
         )
@@ -1263,14 +1265,13 @@ class DbusHelper:
 
         # Voltage control
         self._dbusservice["/Info/BatteryLowVoltage"] = self.battery.min_battery_voltage
-        self._dbusservice["/Info/MaxChargeVoltage"] = (
-            round(self.battery.control_voltage + utils.VOLTAGE_DROP, 2) if self.battery.control_voltage is not None else None
-        )
-        self._dbusservice["/Info/MaxChargeCellVoltage"] = (
-            round(self.battery.max_battery_voltage / self.battery.cell_count, 3)
-            if self.battery.max_battery_voltage is not None and self.battery.cell_count is not None
-            else None
-        )
+        # Skip None writes as for the charge current limits below: control_voltage and max_battery_voltage stay None
+        # until manage_charge_voltage() runs on a good poll, and a failed first poll must not replace the configured
+        # maximum registered in setup_vedbus() with None (dbus-aggregate-batteries cannot form the bank CVL from it)
+        if self.battery.control_voltage is not None:
+            self._dbusservice["/Info/MaxChargeVoltage"] = round(self.battery.control_voltage + utils.VOLTAGE_DROP, 2)
+        if self.battery.max_battery_voltage is not None and self.battery.cell_count is not None:
+            self._dbusservice["/Info/MaxChargeCellVoltage"] = round(self.battery.max_battery_voltage / self.battery.cell_count, 3)
 
         # Charge control. Skip None writes so consumers like dbus-aggregate-batteries
         # that arithmetic on these paths don't crash on transient None during startup
