@@ -34,9 +34,48 @@ _BusConnection = type(
     },
 )
 
+
+class _DBusException(Exception):
+    """dbus.exceptions.DBusException: carries the D-Bus error name that callers classify on."""
+
+    def __init__(self, *args, name=None):
+        super().__init__(*args)
+        self._dbus_error_name = name
+
+    def get_dbus_name(self):
+        return self._dbus_error_name
+
+
+class _Interface:
+    """dbus.Interface: binds a proxy object to one interface; calls go through the proxy's get_dbus_method()."""
+
+    def __init__(self, obj, dbus_interface):
+        self.proxy_object = obj
+        self.dbus_interface = dbus_interface
+
+    def get_dbus_method(self, member, dbus_interface=None):
+        return self.proxy_object.get_dbus_method(member, dbus_interface or self.dbus_interface)
+
+    def __getattr__(self, member):
+        if member.startswith("__"):
+            raise AttributeError(member)
+        return self.get_dbus_method(member)
+
+
 _dbus_bus = _stub("dbus.bus", BusConnection=_BusConnection)
 _dbus_svc = _stub("dbus.service")
-_dbus = _stub("dbus", bus=_dbus_bus, service=_dbus_svc)
+_dbus_exceptions = _stub("dbus.exceptions", DBusException=_DBusException)
+_dbus = _stub(
+    "dbus",
+    bus=_dbus_bus,
+    service=_dbus_svc,
+    exceptions=_dbus_exceptions,
+    Interface=_Interface,
+    # dbus-python's value types subclass the Python ones
+    Dictionary=type("Dictionary", (dict,), {}),
+    Int32=type("Int32", (int,), {}),
+    Double=type("Double", (float,), {}),
+)
 _stub("dbus.mainloop")
 _stub("dbus.mainloop.glib")
 
