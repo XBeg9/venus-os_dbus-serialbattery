@@ -938,6 +938,11 @@ class Battery(ABC):
                 float_voltage = round((utils.FLOAT_CELL_VOLTAGE * self.cell_count), 2)
                 charge_mode = "Float"
 
+                # The Cell OVP limiter does not run in float: drop its state, else the next bulk phase starts in its
+                # hold/ramp from the float CVL with a "(Cell OVP*)" label, however long ago the last limit was
+                self.control_voltage_last_limit_time = None
+                self.control_voltage_ramp_base = None
+
                 # reset bulk when going into float
                 if self.soc_reset_requested:
                     # logger.info("set soc_reset_requested to False")
