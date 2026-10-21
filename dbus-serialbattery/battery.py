@@ -347,6 +347,8 @@ class Battery(ABC):
         self.control_voltage: float = None
         self.control_voltage_last_limit_time: int = None
         self.control_voltage_ramp_base: float = None
+        # last poll with a cell over the allowed cell voltage, holds the " (Cell OVP)" label
+        self.cell_over_max_last_time: int = None
         self.soc_reset_requested: bool = False
         self.soc_reset_last_reached: int = 0  # save state to preserve on restart
         self.soc_reset_battery_voltage: int = None
@@ -715,6 +717,17 @@ class Battery(ABC):
             voltage_sum = round(self.get_cell_voltage_sum(), 6)
             voltage_cell_diff = round(self.get_max_cell_voltage() - self.get_min_cell_voltage(), 6)
 
+            # Get maximum allowed cell voltage
+            cell_voltage_max_allowed = utils.SOC_RESET_CELL_VOLTAGE if self.soc_reset_requested else utils.MAX_CELL_VOLTAGE
+            cell_over_max = self.get_max_cell_voltage() > cell_voltage_max_allowed
+            if cell_over_max:
+                self.cell_over_max_last_time = current_time
+            # Hold the " (Cell OVP)" label for CVL_RECOVERY_HOLD_SEC after the last cell over the limit where the CVL is
+            # not reduced (float, or every cell at or above the limit at max). A top cell at the limit reads 3.450 /
+            # 3.451 V on alternate polls, and dbus-aggregate-batteries (KEEP_MAX_CVL) switches between the lowest and
+            # the highest pack CVL on that label, so without a hold the bank CVL flipped on every poll
+            cell_over_max_held = self.cell_over_max_last_time is not None and current_time - self.cell_over_max_last_time < utils.CVL_RECOVERY_HOLD_SEC
+
             if self.max_voltage_start_time is None:
                 # start timer, if max voltage is reached and cells are balanced
                 if (
@@ -774,10 +787,6 @@ class Battery(ABC):
 
             # Bulk or absorption mode
             if self.allow_max_voltage:
-
-                # Get maximum allowed cell voltage
-                cell_voltage_max_allowed = utils.SOC_RESET_CELL_VOLTAGE if self.soc_reset_requested else utils.MAX_CELL_VOLTAGE
-                cell_over_max = self.get_max_cell_voltage() > cell_voltage_max_allowed
 
                 # use P-Controller
                 if utils.CVL_CONTROLLER_MODE == 1:
@@ -865,6 +874,8 @@ class Battery(ABC):
                     self.control_voltage = max_voltage
                     self.control_voltage_last_limit_time = None
                     self.control_voltage_ramp_base = None
+                    if cell_over_max_held:
+                        self.charge_mode += " (Cell OVP)"  # Cell over voltage protection
 
                 # Set control voltage immediately, if control voltage is lower than previous control voltage
                 # or if it remains the same
@@ -980,7 +991,7 @@ class Battery(ABC):
                 # combine several packs (dbus-aggregate-batteries KEEP_MAX_CVL) only take the lowest CVL when a pack
                 # says "Cell OVP", else a pack in float is charged at another pack's bulk voltage. Appended after the
                 # mode, so the startswith("Float") / ("Float Transition") checks above still see the state.
-                if self.get_max_cell_voltage() > utils.MAX_CELL_VOLTAGE:
+                if cell_over_max_held:
                     charge_mode += " (Cell OVP)"
 
                 self.charge_mode = charge_mode
