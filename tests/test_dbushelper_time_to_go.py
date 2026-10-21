@@ -188,6 +188,16 @@ def test_time_to_go_reads_its_four_settings_without_introspection(publish):
     assert time_to_go_targets(bat) == [10], "the poll must have recalculated TimeToGo"
 
 
+@pytest.mark.parametrize("value,text", [(dbus.Int32(10), "10"), (dbus.Double(15.0), "15.0")], ids=["Int32", "Double"])
+def test_a_setting_is_read_as_the_text_the_walk_stored(value, text):
+    # get_settings_with_values() stored str(value) and the TimeToGo block parses that text (int("10"), int(float("15.0")));
+    # on the Cerbo, str() of python-dbus's Int32/Double gives "10" and "80.0"
+    settings = LocalSettings({STATE: value})
+    helper = DbusHelper(Seplos("/dev/ttyUSB1", 19200, b"\x00"))
+
+    assert helper.get_setting_value(settings, VICTRON_SETTINGS_DBUS_NAME, STATE) == text
+
+
 # --------------------------------------------------------------------------- which SoC TimeToGo counts down to
 
 
