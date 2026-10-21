@@ -289,6 +289,62 @@ def test_block_on_disconnect_blocks_charge_and_discharge_whatever_the_cells(env,
     loop.quit.assert_called_once()
 
 
+def poll(clock, link, helper, loop, cells_mv, pattern):
+    """One 5 s poll per character, 'x' the pack does not answer, '.' it answers; returns (seconds, limits) per poll."""
+    t_first = clock.t + POLL
+    rows = []
+    for c in pattern:
+        link.silence() if c == "x" else link.answer(cells_mv)
+        clock.t += POLL
+        helper.publish_battery(loop)
+        rows.append((clock.t - t_first, limits(helper._dbusservice)))
+    return rows
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        pytest.param("x.x", id="2 failed reads 10 s apart"),
+        pytest.param("x..x", id="2 failed reads 15 s apart"),
+        pytest.param("x" + "." * 10 + "x", id="2 failed reads 55 s apart"),
+        pytest.param("x.x.x.x", id="every other read fails for 30 s"),
+    ],
+)
+@pytest.mark.parametrize(
+    "cells_mv, block_on_disconnect",
+    [
+        pytest.param([3400] * 15 + [3460], False, id="top cell above the band"),
+        pytest.param([3200] + [3300] * 15, False, id="bottom cell below the band"),
+        pytest.param([3300] * CELLS, True, id="BLOCK_ON_DISCONNECT"),
+    ],
+)
+def test_failed_reads_between_answers_do_not_block(env, monkeypatch, cells_mv, block_on_disconnect, pattern):
+    # A garbled or collided frame on the shared two-pack bus counts as a failed read (test_seplos_garbled_frames), while
+    # the pack still answers every other poll. The error episode only closes after 60 s without errors, so measured
+    # from its first error two such reads 10..55 s apart looked like 10 s of silence: the pack was blocked, and the
+    # aggregate (min x 2, Allow = min) stopped the inverter for the DCL hold and cut solar for the CCL hold and ramp.
+    monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", block_on_disconnect)
+    clock, link, bat, helper, svc, loop = env
+    before = connect(clock, link, helper, loop, cells_mv)
+
+    rows = poll(clock, link, helper, loop, cells_mv, pattern + "." * 30)
+
+    loop.quit.assert_not_called()
+    assert [r for r in rows if r[1] != before] == []
+
+
+def test_a_silence_after_a_failed_read_is_blocked_10_s_after_its_own_first_failed_poll(env):
+    # The pack answers again after one failed read, then really stops: the 10 s count from the failed poll that
+    # starts the silence, not from the first error of the episode.
+    clock, link, bat, helper, svc, loop = env
+    cells = [3400] * 15 + [3460]  # top cell above the band
+    before = connect(clock, link, helper, loop, cells)
+
+    rows = poll(clock, link, helper, loop, cells, "x...xxx")  # failed 0 s, answers 5..15 s, silent from 20 s
+
+    assert rows[4:] == [(20, before), (25, before), (30, BLOCKED)]
+
+
 def test_offline_inside_the_safe_band_rides_through_until_the_timeout(env):
     # BLOCK_ON_DISCONNECT = False and cells in the band: "charge and discharge continue for
     # BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES minutes (default: 30) before the driver exits"
@@ -333,21 +389,18 @@ def test_limits_recover_from_zero_through_hold_and_ramp_after_a_blocked_outage(e
     assert seen[895][2:] == (70, 140, 1, 1)  # CCL back in full 700 s after its hold
 
 
-def test_a_pack_that_answers_briefly_between_silences_is_blocked_again_at_once(env):
+def test_a_pack_that_answers_between_silences_is_blocked_again_when_it_falls_silent_again(env):
     # The offline mark is set once per error episode (error["cleared"] only returns after 60 s without errors), so a
-    # pack that answered for a while in between is not marked offline again; its next failed poll must still block.
+    # pack that answered for a while in between is not marked offline again; 10 s into its next silence it must still
+    # be blocked. Its limits are still 0 from the recovery hold then, so the block shows in the reconnect after it:
+    # the DCL hold starts again instead of finishing the one that started at the first reconnect.
     clock, link, bat, helper, svc, loop = env
     cells = [3400] * 15 + [3460]  # top cell above the band
     connect(clock, link, helper, loop, cells)
-    go_silent(clock, link, helper, loop, 15)  # failed polls 0, 5, 10 s: offline and blocked
-    assert limits(svc) == BLOCKED
 
-    link.answer(cells)
-    for _ in range(8):  # good polls 15 .. 50 s: DCL holds 30 s, then ramps
-        clock.t += POLL
-        helper.publish_battery(loop)
-    assert svc["/Info/MaxDischargeCurrent"] > 0 and svc["/Io/AllowToDischarge"] == 1
+    # failed 0..10 s (blocked), answers 15..25 s (DCL hold from 15 s), failed 30..40 s, answers from 45 s
+    rows = poll(clock, link, helper, loop, cells, "xxx" + "..." + "xxx" + "." * 10)
 
-    go_silent(clock, link, helper, loop, POLL)  # 55 s after the first failed poll of this episode
     loop.quit.assert_not_called()
-    assert limits(svc) == BLOCKED
+    dcl = dict((t, lim[1]) for t, lim in rows)
+    assert [dcl[t] for t in range(45, 95, POLL)] == [0] * 7 + [25, 50, 75]  # 30 s hold from 45 s, then 5 A/s

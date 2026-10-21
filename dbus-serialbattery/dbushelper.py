@@ -125,7 +125,7 @@ class DbusHelper:
         self.battery = battery
         self.instance: int = 1
         self.settings = None
-        self.error: dict = {"cleared": True, "count": 0, "timestamp_first": None, "timestamp_last": None}
+        self.error: dict = {"cleared": True, "count": 0, "timestamp_first": None, "timestamp_last": None, "timestamp_silence_start": None}
         self.cell_voltages_good: bool = None
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
@@ -970,6 +970,9 @@ class DbusHelper:
                     # show info that battery is reconnected and stable again
                     logger.info(">>> Battery reconnected <<<")
 
+                # the pack answered: a later failed read starts a new silence
+                self.error["timestamp_silence_start"] = None
+
                 self.battery.online = True
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
@@ -1024,6 +1027,8 @@ class DbusHelper:
                 # update error variables
                 if self.error["count"] == 0:
                     self.error["timestamp_first"] = int(time())
+                if self.error["timestamp_silence_start"] is None:
+                    self.error["timestamp_silence_start"] = int(time())
 
                 self.error["count"] += 1
                 self.error["timestamp_last"] = int(time())
@@ -1083,13 +1088,17 @@ class DbusHelper:
 
                             self.battery.init_values()
 
-                        # Block as documented for BLOCK_ON_DISCONNECT and for cells outside the safe band.
-                        # manage_charge_and_discharge_current() only runs on a successful read, so without this the
-                        # last limits and AllowTo* = 1 stay published until the driver exits, and consumers like
-                        # dbus-aggregate-batteries keep using them. Done on every failed poll, not only when the battery
-                        # is marked offline, so a pack that answered once in between is blocked again.
-                        if utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good:
-                            self.battery.block_charge_and_discharge("BMS not responding")
+                    # Block as documented for BLOCK_ON_DISCONNECT and for cells outside the safe band.
+                    # manage_charge_and_discharge_current() only runs on a successful read, so without this the
+                    # last limits and AllowTo* = 1 stay published until the driver exits, and consumers like
+                    # dbus-aggregate-batteries keep using them.
+                    # Measured from the last answer, not from the first error of the episode, which stays open for 60 s
+                    # after its last error: a garbled frame on a shared bus is a failed read too, and two of them between
+                    # answers must not stop the bank for the whole recovery hold and ramp. Checked on every failed poll,
+                    # not only when marked offline (once per episode), so a pack that answered in between is blocked again.
+                    silence = self.error["timestamp_last"] - self.error["timestamp_silence_start"]
+                    if silence >= RETRY_CYCLE_SHORT_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                        self.battery.block_charge_and_discharge("BMS not responding")
 
                     # set connection info
                     remaining = self.disconnect_threshold - time_since_first_error
