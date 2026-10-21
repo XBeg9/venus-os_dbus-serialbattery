@@ -5,7 +5,7 @@ pyserial's read_until loops read(1): a select, an os.read and the timeout bookke
 the Cerbo that cost 28-33 ms CPU per command, 4 commands per 5 s poll for two packs. The reply now comes with one
 os.read per wake-up (6-10 ms per command), up to the frame's first CR or a 1 s deadline from the write, and a port that
 hangs up or fails raises pyserial's own SerialException as before. Real pyserial on a pseudo terminal, a thread playing
-the BMS; the hang-up case uses a pipe whose write end is closed.
+the BMS; the hang-up case uses a pipe whose write end is closed, the deadline case a pipe and a clock the test moves.
 """
 
 import errno
@@ -166,21 +166,31 @@ def test_bytes_just_before_the_deadline_do_not_extend_the_read(pty_bms, monkeypa
     assert elapsed < 0.45, f"read_status_data took {elapsed:.2f} s for a 0.3 s deadline"
 
 
-def hung_up_serial(reply: bytes):
-    """serial.Serial as read_serial_data_seplos uses it, on a pipe that holds `reply` and whose write end is closed."""
+def pipe_serial(reply: bytes, hang_up: bool):
+    """
+    serial.Serial as read_serial_data_seplos uses it, on a pipe that holds `reply`. With hang_up the write end is closed,
+    else it stays open, so the pipe has nothing more to read but no EOF either. The read end of each port is in .fds.
+    """
 
-    class HungUpSerial:
+    class PipeSerial:
+        fds = []
+
         def __init__(self, *args, **kwargs):
             pass
 
         def __enter__(self):
-            self.r, w = os.pipe()
-            os.write(w, reply)
-            os.close(w)  # an unplugged adapter: always readable, and a read returns no data
+            self.r, self.w = os.pipe()
+            os.write(self.w, reply)
+            if hang_up:
+                os.close(self.w)  # an unplugged adapter: always readable, and a read returns no data
+                self.w = None
+            PipeSerial.fds.append(self.r)
             return self
 
         def __exit__(self, *exc):
             os.close(self.r)
+            if self.w is not None:
+                os.close(self.w)
             return False
 
         def flushOutput(self):
@@ -195,16 +205,55 @@ def hung_up_serial(reply: bytes):
         def fileno(self):
             return self.r
 
-    return HungUpSerial
+    return PipeSerial
 
 
 def test_a_port_that_hangs_up_raises_at_once_instead_of_spinning_to_the_deadline(monkeypatch):
     # without the check, select keeps saying readable and os.read keeps returning b"": a busy loop until the deadline
-    monkeypatch.setattr(seplos_module.serial, "Serial", hung_up_serial(FRAME[:90]))
+    monkeypatch.setattr(seplos_module.serial, "Serial", pipe_serial(FRAME[:90], hang_up=True))
     start = time.monotonic()
     with pytest.raises(serial.SerialException, match="device reports readiness to read but returned no data"):
         make_seplos("/dev/ttyUSB1").read_status_data()
     assert time.monotonic() - start < 0.2
+
+
+class Clock:
+    """seplos_module.time with a monotonic clock that the test moves; the rest is the real time module."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_a_read_that_ends_past_the_deadline_returns_what_arrived_without_another_select(monkeypatch):
+    # the bus is still sending at the deadline (noise, no CR, more than one os.read takes) and the driver is descheduled
+    # across it during a read: the read ends there with what it has. It must not call select with the negative time left
+    # (ValueError, not a SerialException: publish_battery's except quits the main loop and the driver exits) nor read on
+    noise = b"\xff" * 600
+    port = pipe_serial(noise, hang_up=False)
+    monkeypatch.setattr(seplos_module.serial, "Serial", port)
+    clock = Clock()
+    monkeypatch.setattr(seplos_module, "time", clock)
+    rx = []
+    monkeypatch.setattr(seplos_module, "capture_raw_data", lambda p, direction, data: rx.append(data) if direction == "rx" else None)
+    reads = []
+    real_read = os.read
+
+    def read(fd, n):
+        if fd in port.fds:
+            reads.append(n)
+            clock.now += seplos_module.REPLY_TIMEOUT + 0.25  # descheduled during the read
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "read", read)
+    assert make_seplos("/dev/ttyUSB1").read_status_data() is False
+    assert len(reads) == 1, f"{len(reads)} os.read calls on the port after the deadline had passed"
+    assert rx == [noise[:512]]
 
 
 def test_a_read_error_on_the_port_raises_serial_exception_at_once(pty_bms):
