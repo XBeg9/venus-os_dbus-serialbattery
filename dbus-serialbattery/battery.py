@@ -757,33 +757,37 @@ class Battery(ABC):
 
             # timer started
             else:
-                if voltage_cell_diff > round(utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DIFF + utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DEVIATION, 6):
-                    self.max_voltage_start_time = current_time
-
-                time_diff = current_time - self.max_voltage_start_time
-                # keep max voltage for SWITCH_TO_FLOAT_WAIT_FOR_SEC more seconds
-                if utils.SWITCH_TO_FLOAT_WAIT_FOR_SEC < time_diff:
-                    self.allow_max_voltage = False
-                    self.max_voltage_start_time = None
-
-                    if self.soc_calc <= utils.SWITCH_TO_BULK_SOC_THRESHOLD:
-                        # set error code, to show in the GUI that something is wrong
-                        self.manage_error_code(8)
-
-                        # write to log, that reset to float was not possible
-                        logger.error(
-                            f"Could not change to float voltage. Battery SoC ({self.soc_calc}%) is lower"
-                            + f" than SWITCH_TO_BULK_SOC_THRESHOLD ({utils.SWITCH_TO_BULK_SOC_THRESHOLD}%)."
-                            + " Please reset SoC manually or lower the SWITCH_TO_BULK_SOC_THRESHOLD in the"
-                            + ' "config.ini".'
-                        )
-
                 # meassurment and variation tolerance in volts, to prevent switching back and forth
                 measurement_tolerance_variation = 0.5
 
-                # Reset max_voltage_start_time when switching to bulk mode, regardless of the previous mode
+                # Reset max_voltage_start_time when switching to bulk mode, regardless of the previous mode.
+                # Checked before the expiry below: the start time restored after a driver restart (DbusHelper.setup_instance)
+                # can be older than SWITCH_TO_FLOAT_WAIT_FOR_SEC, and a pack that is not near max voltage must not switch to
+                # float on it. Only a timer that is still running is checked for the spread restart and the expiry
                 if voltage_sum < self.max_battery_voltage - measurement_tolerance_variation:
                     self.max_voltage_start_time = None
+
+                else:
+                    if voltage_cell_diff > round(utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DIFF + utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DEVIATION, 6):
+                        self.max_voltage_start_time = current_time
+
+                    time_diff = current_time - self.max_voltage_start_time
+                    # keep max voltage for SWITCH_TO_FLOAT_WAIT_FOR_SEC more seconds
+                    if utils.SWITCH_TO_FLOAT_WAIT_FOR_SEC < time_diff:
+                        self.allow_max_voltage = False
+                        self.max_voltage_start_time = None
+
+                        if self.soc_calc <= utils.SWITCH_TO_BULK_SOC_THRESHOLD:
+                            # set error code, to show in the GUI that something is wrong
+                            self.manage_error_code(8)
+
+                            # write to log, that reset to float was not possible
+                            logger.error(
+                                f"Could not change to float voltage. Battery SoC ({self.soc_calc}%) is lower"
+                                + f" than SWITCH_TO_BULK_SOC_THRESHOLD ({utils.SWITCH_TO_BULK_SOC_THRESHOLD}%)."
+                                + " Please reset SoC manually or lower the SWITCH_TO_BULK_SOC_THRESHOLD in the"
+                                + ' "config.ini".'
+                            )
 
             # Bulk or absorption mode
             if self.allow_max_voltage:
