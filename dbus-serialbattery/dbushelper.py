@@ -54,9 +54,12 @@ class _CachedDbusProxy:
     they go to a velib ServiceContext, which emits all changed paths in
     one ItemsChanged signal at the end instead of one PropertiesChanged
     per path.
+
+    A batch belongs to the thread that opened it until it closes; other
+    threads' batches and writes wait for it (see _lock).
     """
 
-    __slots__ = ("_svc", "_cache", "_batch", "_batch_depth")
+    __slots__ = ("_svc", "_cache", "_batch", "_batch_depth", "_lock")
 
     def __init__(self, svc):
         self._svc = svc
@@ -65,12 +68,19 @@ class _CachedDbusProxy:
         # through to __getattr__ and read the service's attribute instead
         self._batch = None
         self._batch_depth: int = 0
+        # Held from __enter__ to the end of __exit__ and around every write. JK BLE with BLUETOOTH_USE_POLLING = False
+        # publishes from its BLE thread while health_check_battery publishes from the GLib loop. velib's __exit__ pops
+        # whichever context is on top of _ratelimiters, so without the lock a batch one thread opened while the other's
+        # was closing left the closing one on the stack, never signalled, and a write from the other thread could land
+        # in a context already flushed. Reentrant: the batch's own writes and a nested batch on the same thread go on.
+        self._lock = threading.RLock()
 
     def __setitem__(self, path, value):
-        prev = self._cache.get(path, _SENTINEL)
-        if prev is not value and prev != value:
-            self._cache[path] = value
-            (self._svc if self._batch is None else self._batch)[path] = value
+        with self._lock:
+            prev = self._cache.get(path, _SENTINEL)
+            if prev is not value and prev != value:
+                self._cache[path] = value
+                (self._svc if self._batch is None else self._batch)[path] = value
 
     def __getitem__(self, path):
         # the service, also during a batch: the context sets each item's value at once and only defers the signal
@@ -86,18 +96,27 @@ class _CachedDbusProxy:
         # Python looks __enter__/__exit__ up on the type, so __getattr__ never forwards them to the service.
         # A nested batch joins the open one: everything up to the outermost exit goes out in one ItemsChanged.
         # A service without velib's context support (VeDbusService.__enter__) keeps per-path writes.
-        if self._batch_depth == 0 and hasattr(type(self._svc), "__enter__"):
-            self._batch = self._svc.__enter__()
-        self._batch_depth += 1
+        self._lock.acquire()
+        try:
+            if self._batch_depth == 0 and hasattr(type(self._svc), "__enter__"):
+                self._batch = self._svc.__enter__()
+            self._batch_depth += 1
+        except BaseException:
+            # Python only calls __exit__ after __enter__ returned
+            self._lock.release()
+            raise
         return self
 
     def __exit__(self, *exc):
-        self._batch_depth -= 1
-        if self._batch_depth == 0 and self._batch is not None:
-            # back to per-path writes before the flush, so a flush that raises cannot leave the proxy in a closed batch
-            self._batch = None
-            # velib pops the context and emits its changes, also when the body raised; the exception still propagates
-            self._svc.__exit__(*exc)
+        try:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch is not None:
+                # back to per-path writes before the flush, so a flush that raises cannot leave the proxy in a closed batch
+                self._batch = None
+                # velib pops the context and emits its changes, also when the body raised; the exception still propagates
+                self._svc.__exit__(*exc)
+        finally:
+            self._lock.release()
         return False
 
 
@@ -1192,6 +1211,9 @@ class DbusHelper:
         # dbus-aggregate-batteries was seen with /Info/MaxChargeVoltage and /Info/ChargeMode from different polls.
         # The block on a silent pack (limits and AllowTo* = 0, /Connected = 0) is set on the battery object and
         # written here, so it is in the same signal.
+        # Poll-timer BMS types and generic_mqtt (GLib.idle_add) call this from the GLib loop. JK BLE with
+        # BLUETOOTH_USE_POLLING = False also calls it from its BLE thread (jkbms_brn.py:349), next to the 5 s
+        # health_check_battery on the GLib loop; the proxy's lock makes the second one wait for the first batch to close.
         with self._dbusservice:
             self._publish_dbus_values()
 

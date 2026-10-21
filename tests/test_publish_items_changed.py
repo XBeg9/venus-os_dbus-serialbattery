@@ -14,6 +14,9 @@ The real Seplos detection and DbusHelper.setup_vedbus/publish_battery/publish_db
 which conftest stubs, so FakeVeDbusService mirrors the parts of vedbus.py that decide which signals go out.
 """
 
+import inspect
+import sys
+import threading
 from collections import Counter
 from unittest.mock import MagicMock
 
@@ -405,3 +408,145 @@ def test_a_service_without_batches_keeps_per_path_writes_in_a_batch():
     with proxy:
         proxy["/A"] = 1
         assert plain == {"/A": 1}
+
+
+# --------------------------------------------------------------------------- two threads, one proxy
+#
+# JK BLE with BLUETOOTH_USE_POLLING = False publishes from its BLE thread (jkbms_brn.py:349 calls poll_battery) while
+# health_check_battery publishes the same pack from the GLib loop every 5 s (dbus-serialbattery.py:676). velib's
+# __exit__ pops whichever context is on top of _ratelimiters, so a batch has to stay one thread's from push to pop.
+
+WAIT = 0.2  # s another thread gets to finish before the test counts it as waiting for the proxy
+
+
+def in_thread(target):
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
+def line_after(method, text):
+    """Number of the source line that follows the first line of method containing text."""
+    lines, first = inspect.getsourcelines(method)
+    for i, line in enumerate(lines):
+        if text in line:
+            return first + i + 1
+    raise AssertionError(f"{text!r} is not in {method.__qualname__}")
+
+
+def test_a_batch_another_thread_opens_while_one_closes_is_not_left_unflushed(proxy, svc):
+    # Found in verification: thread B's "with proxy:" runs right after thread A's __exit__ has counted the depth down to
+    # 0. B saw depth 0 and pushed its own context; A then saw depth 1 and never popped its own. /A stayed in a context
+    # nobody flushes, and the dedup cache never sends 1 again, so consumers kept the old value (on /Io/AllowToCharge
+    # they would never see the block).
+    exit_code = _CachedDbusProxy.__exit__.__code__
+    window = line_after(_CachedDbusProxy.__exit__, "self._batch_depth -= 1")
+    second = []
+
+    def batch_b():
+        with proxy:
+            proxy["/B"] = 2
+
+    def tracer(frame, event, arg):  # sys.settrace is per thread: only thread A is traced
+        if frame.f_code is not exit_code:
+            return None
+
+        def in_exit(frame, event, arg):
+            if event == "line" and frame.f_lineno == window and not second:
+                second.append(in_thread(batch_b))
+                second[0].join(WAIT)
+            return in_exit
+
+        return in_exit
+
+    sys.settrace(tracer)
+    try:
+        with proxy:
+            proxy["/A"] = 1
+    finally:
+        sys.settrace(None)
+    assert second, "thread B was never started: the window is not in __exit__"
+    second[0].join(5)
+    assert not second[0].is_alive()
+
+    assert svc._ratelimiters == [], f"left on _ratelimiters, never signalled: {[c.changes for c in svc._ratelimiters]}"
+    assert svc.signals == [
+        ("ItemsChanged", {"/A": {"Value": 1, "Text": "1"}}),
+        ("ItemsChanged", {"/B": {"Value": 2, "Text": "2"}}),
+    ]
+
+
+def test_a_write_from_another_thread_waits_for_the_open_batch_and_goes_out_on_its_own(proxy, svc):
+    # publish_battery writes /Alarms/BmsCable = 2 outside the batch (dbushelper.py:1172). From the BLE thread that write
+    # took the GLib thread's open context; if the context was flushed between that and the store, the value was set on
+    # the service and never signalled.
+    opened, close = threading.Event(), threading.Event()
+
+    def batch_a():
+        with proxy:
+            proxy["/A"] = 1
+            opened.set()
+            close.wait(5)
+
+    def write_b():
+        proxy["/B"] = 2
+
+    owner = in_thread(batch_a)
+    assert opened.wait(5)
+    writer = in_thread(write_b)
+    writer.join(WAIT)
+    assert writer.is_alive(), f"the write did not wait for the other thread's batch: {svc.signals or 'stored in its context'}"
+    assert svc.signals == []
+
+    close.set()
+    owner.join(5)
+    writer.join(5)
+    assert not owner.is_alive() and not writer.is_alive()
+    assert svc.signals == [
+        ("ItemsChanged", {"/A": {"Value": 1, "Text": "1"}}),
+        ("PropertiesChanged", "/B", {"Value": 2, "Text": "2"}),
+    ]
+    assert svc._ratelimiters == []
+
+
+class ServiceThatCannotBatch(FakeVeDbusService):
+    def __enter__(self):
+        raise RuntimeError("no context")
+
+
+def test_a_batch_that_fails_to_open_lets_other_threads_write():
+    svc = ServiceThatCannotBatch()
+    svc.add_path("/A", None)
+    proxy = _CachedDbusProxy(svc)
+    with pytest.raises(RuntimeError, match="no context"):
+        with proxy:
+            pass
+
+    def write_a():
+        proxy["/A"] = 1
+
+    writer = in_thread(write_a)
+    writer.join(5)
+    assert not writer.is_alive(), "the failed batch kept the proxy locked"
+    assert svc.signals == [("PropertiesChanged", "/A", {"Value": 1, "Text": "1"})]
+
+
+def test_a_batch_whose_flush_raises_lets_other_threads_batch(proxy, svc):
+    def bus_error(changes):
+        raise RuntimeError("org.freedesktop.DBus.Error.NoMemory")
+
+    svc.root.ItemsChanged = bus_error
+    with pytest.raises(RuntimeError, match="NoMemory"):
+        with proxy:
+            proxy["/A"] = 1
+    svc.root.ItemsChanged = FakeRootExport(svc.signals).ItemsChanged
+
+    def batch_b():
+        with proxy:
+            proxy["/B"] = 2
+
+    other = in_thread(batch_b)
+    other.join(5)
+    assert not other.is_alive(), "the failed flush kept the proxy locked"
+    assert svc.signals == [("ItemsChanged", {"/B": {"Value": 2, "Text": "2"}})]
+    assert svc._ratelimiters == []
