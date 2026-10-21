@@ -293,8 +293,8 @@ class Seplos(Battery):
             return False
 
         chksum = Seplos.get_checksum(data[1:-5])
-        # readline() returns whatever arrived, line noise and non-ASCII included: a checksum field that is not hex is a
-        # broken frame, not an exception (that would quit the main loop in publish_battery and stop the driver)
+        # the serial read returns whatever arrived, line noise and non-ASCII included: a checksum field that is not hex
+        # is a broken frame, not an exception (that would quit the main loop in publish_battery and stop the driver)
         try:
             chksum_received = Seplos.int_from_2byte_hex_ascii(data, -5)
         except (ValueError, UnicodeDecodeError):
@@ -321,7 +321,10 @@ class Seplos(Battery):
             capture_raw_data(self.port, "tx", command)
             logger.debug("wrote {} bytes to serial port {}, command={}".format(written, self.port, command))
 
-            data = ser.readline()
+            # a Seplos frame ends with EOI CR: readline() only stops at LF, so every command waited out the full timeout
+            # (about 4 s of each 5 s poll for two packs). The timeout still ends a frame that is cut short; the checksum
+            # and the callers' info length check reject it.
+            data = ser.read_until(b"\r")
             capture_raw_data(self.port, "rx", data)
 
             if not Seplos.is_valid_frame(data):

@@ -1,8 +1,8 @@
 """
 Garbled bytes on the RS485 bus must be a failed Seplos read, not an exception (review 2026-10-21).
 
-readline() returns whatever bytes arrived: line noise, a frame cut by a collision, non-ASCII. The frame check decoded
-the checksum field with bytes.fromhex(...decode("ascii")) unguarded, so such a line raised UnicodeDecodeError or
+The serial read returns whatever bytes arrived: line noise, a frame cut by a collision, non-ASCII. The frame check
+decoded the checksum field with bytes.fromhex(...decode("ascii")) unguarded, so such a line raised UnicodeDecodeError or
 ValueError out of read_status_data, through refresh_data, into publish_battery's catch-all, which quits the main loop:
 the driver exited and both pack services left D-Bus until serial-starter restarted it. read_alarm_data already treated
 undecodable data as a failed read; now every read does, and publish_battery counts it like any other failed read.
@@ -39,7 +39,7 @@ def reply_frame(address: int, info: bytes) -> bytes:
 
 
 class OneReplySerial:
-    """Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, readline."""
+    """Stands in for serial.Serial as read_serial_data_seplos uses it: context manager, flush*, write, read_until."""
 
     reply = b""
 
@@ -61,8 +61,11 @@ class OneReplySerial:
     def write(self, data):
         return len(data)
 
-    def readline(self):
-        return type(self).reply
+    def read_until(self, expected=b"\n", size=None):
+        # the whole reply is already in the input buffer: pyserial returns it up to and including `expected`
+        reply = type(self).reply
+        end = reply.find(expected)
+        return reply if end < 0 else reply[: end + len(expected)]
 
 
 @pytest.fixture
