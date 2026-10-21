@@ -231,6 +231,13 @@ class Seplos(Battery):
         if data is False or len(data) != 150:
             return False
 
+        # the checksum does not tell whether the info is hex: check it before decode_status_data writes any value
+        try:
+            bytes.fromhex(data.decode("ascii"))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("could not hex-decode raw status data", exc_info=e)
+            return False
+
         if not self.decode_status_data(data):
             return False
 
@@ -286,7 +293,14 @@ class Seplos(Battery):
             return False
 
         chksum = Seplos.get_checksum(data[1:-5])
-        if chksum != Seplos.int_from_2byte_hex_ascii(data, -5):
+        # readline() returns whatever arrived, line noise and non-ASCII included: a checksum field that is not hex is a
+        # broken frame, not an exception (that would quit the main loop in publish_battery and stop the driver)
+        try:
+            chksum_received = Seplos.int_from_2byte_hex_ascii(data, -5)
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("checksum error, data={}".format(data))
+            return False
+        if chksum != chksum_received:
             logger.warning("checksum error")
             return False
 
@@ -315,7 +329,11 @@ class Seplos(Battery):
 
             length_pos = 10
             return_data = data[length_pos + 3 : -5]
-            info_length = Seplos.int_from_2byte_hex_ascii(b"0" + data[length_pos:], 0)
+            try:
+                info_length = Seplos.int_from_2byte_hex_ascii(b"0" + data[length_pos:], 0)
+            except (ValueError, UnicodeDecodeError):
+                logger.warning("length field is not hex, data={}".format(data))
+                return False
             logger.debug("returning info data of length {}, info_length is {} : {}".format(len(return_data), info_length, return_data))
 
             return return_data
